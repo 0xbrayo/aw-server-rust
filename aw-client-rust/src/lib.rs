@@ -111,7 +111,6 @@ impl AwClient {
             .map(|(start, stop)| (start.to_rfc3339(), stop.to_rfc3339()))
             .map(|(start, stop)| format!("{}/{}", start, stop))
             .collect();
-
         // Result is a sequence, one element per timeperiod
         self.client
             .post(url)
