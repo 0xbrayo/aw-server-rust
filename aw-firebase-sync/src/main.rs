@@ -29,8 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let aw_client = AwClient::new("localhost", port, "aw-firebase-sync").unwrap();
-
+    #[allow(deprecated)]
     let start = Utc::now().date().and_hms_opt(0, 0, 0).unwrap() - chrono::Duration::days(6);
+    #[allow(deprecated)]
     let end = Utc::now().date().and_hms_opt(0, 0, 0).unwrap() + chrono::Duration::days(1);
 
     let path = config_dir()
