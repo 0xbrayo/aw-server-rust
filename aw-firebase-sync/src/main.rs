@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));
             not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);
             events = filter_period_intersect(events, not_afk);
-            events = categorize(events, [[[\"Work\"], {\"type\": \"regex\", \"regex\": \"aw|ActivityWatch\", \"ignore_case\": true}]]);
+            events = categorize(events, [[[\"Work\"], {\"type\": \"regex\", \"regex\": \"aw-|ActivityWatch\", \"ignore_case\": true}]]);
             events = filter_keyvals(events, \"$category\", [[\"Work\"]]);
             RETURN = events;
         ";
@@ -84,8 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let query_data = serde_json::to_string(&query_result[0]).unwrap();
 
-    let firebase_url = "https://us-central1-aw-mockup.cloudfunctions.net/uploadData";
-    // let firebase_url = "http://localhost:5001/aw-mockup/us-central1/uploadData";
+    // let firebase_url = "https://us-central1-aw-mockup.cloudfunctions.net/uploadData";
+    let firebase_url = "http://localhost:5001/aw-mockup/us-central1/uploadData";
 
     let payload = json!({
         "apiKey": apikey,
