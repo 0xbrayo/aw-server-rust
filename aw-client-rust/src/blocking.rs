@@ -79,6 +79,7 @@ impl AwClient {
     proxy_method!(delete_event, (), bucketname: &str, event_id: i64);
     proxy_method!(get_event_count, i64, bucketname: &str);
     proxy_method!(get_info, aw_models::Info,);
+    proxy_method!(get_setting, aw_models::Settings, setting: &str);
 
     pub fn wait_for_start(&self) -> Result<(), Box<dyn Error>> {
         self.client.wait_for_start()
