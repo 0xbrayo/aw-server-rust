@@ -123,6 +123,12 @@ impl AwClient {
             .map(|(start, stop)| format!("{}/{}", start, stop))
             .collect();
 
+        let query_lines: Vec<&str> = query.split('\n').collect();
+        let payload = json!({
+            "query": query_lines,
+            "timeperiods": timeperiods_str,
+        });
+
         // Result is a sequence, one element per timeperiod
         self.client
             .post(url)
