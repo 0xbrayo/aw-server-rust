@@ -4,7 +4,7 @@ use jni::sys::jstring;
 use aw_client_rust::blocking::AwClient;
 use serde_json::json;
 
-use crate::{pull, pull_all, push};
+use crate::{pull, pull_all, push_with_hostname};
 
 /// Helper function to convert Rust string to Java string
 fn rust_string_to_jstring(env: &JNIEnv, s: String) -> jstring {
@@ -128,7 +128,7 @@ pub extern "C" fn Java_net_activitywatch_android_SyncInterface_syncPush(
     
     let result: Result<String, String> = (|| {
         let client = get_client(port)?;
-        push(&client)
+        push_with_hostname(&client, &hostname_str)
             .map_err(|e| format!("Sync push failed: {}", e))?;
         Ok(json!({
             "success": true,
@@ -178,7 +178,7 @@ pub extern "C" fn Java_net_activitywatch_android_SyncInterface_syncBoth(
         pull_all(&client)
             .map_err(|e| format!("Pull phase failed: {}", e))?;
         
-        push(&client)
+        push_with_hostname(&client, &hostname_str)
             .map_err(|e| format!("Push phase failed: {}", e))?;
         
         Ok(json!({
