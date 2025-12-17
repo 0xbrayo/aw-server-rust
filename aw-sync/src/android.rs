@@ -39,6 +39,8 @@ pub extern "C" fn Java_net_activitywatch_android_SyncInterface_syncPullAll(
             }).to_string());
         }
     };
+    // Set hostname for sync operations
+    std::env::set_var("AW_HOSTNAME", &hostname_str);
     
     let result: Result<String, String> = (|| {
         let client = get_client(port)?;
@@ -121,6 +123,8 @@ pub extern "C" fn Java_net_activitywatch_android_SyncInterface_syncPush(
         }
     };
     
+    // Set hostname for sync operations
+    std::env::set_var("AW_HOSTNAME", &hostname_str);
     
     let result: Result<String, String> = (|| {
         let client = get_client(port)?;
@@ -165,6 +169,8 @@ pub extern "C" fn Java_net_activitywatch_android_SyncInterface_syncBoth(
             }).to_string());
         }
     };
+    // Set hostname for sync operations
+    std::env::set_var("AW_HOSTNAME", &hostname_str);
     
     let result: Result<String, String> = (|| {
         let client = get_client(port)?;
