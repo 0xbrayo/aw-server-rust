@@ -19,6 +19,7 @@ aw-transform = { path = "../aw-transform" }
 
 [dev-dependencies]
 criterion = "0.5.1"
+mimalloc = "0.1"
 
 [[bench]]
 name = "benchmark"

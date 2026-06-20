@@ -17,6 +17,17 @@ extern crate jemallocator;
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+// Use mimalloc everywhere else (Windows/macOS/Linux desktop). Android builds
+// the JNI cdylib via lib.rs, not this binary, so it is unaffected and keeps the
+// system allocator. The cfg matches the dependency gate in Cargo.toml and is
+// mutually exclusive with the jemalloc allocator above.
+#[cfg(all(
+    not(target_os = "android"),
+    not(all(target_os = "linux", target_arch = "x86"))
+))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Rust server for ActivityWatch
 #[derive(Parser)]
 #[clap(version = crate_version!(), author = "Johan Bjäreholt, Erik Bjäreholt, et al.")]
