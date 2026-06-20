@@ -16,6 +16,20 @@ pub fn fill_env(env: &mut VarEnv) {
         DataType::Function("query_bucket".to_string(), qfunctions::query_bucket),
     );
     env.insert(
+        "query_bucket_grouped".to_string(),
+        DataType::Function(
+            "query_bucket_grouped".to_string(),
+            qfunctions::query_bucket_grouped,
+        ),
+    );
+    env.insert(
+        "query_bucket_intersected".to_string(),
+        DataType::Function(
+            "query_bucket_intersected".to_string(),
+            qfunctions::query_bucket_intersected,
+        ),
+    );
+    env.insert(
         "query_bucket_names".to_string(),
         DataType::Function(
             "query_bucket_names".to_string(),
@@ -141,17 +155,68 @@ mod qfunctions {
         env: &VarEnv,
         ds: &Datastore,
     ) -> Result<DataType, QueryError> {
-        // Typecheck
-        validate::args_length(&args, 1)?;
+        // Typecheck: at least the bucket id; an optional filter list may follow.
+        if args.is_empty() {
+            return Err(QueryError::InvalidFunctionParameters(
+                "query_bucket needs at least one argument (bucket id)".to_string(),
+            ));
+        }
 
-        let bucket_id: String = args.into_iter().next().unwrap().try_into()?;
+        let bucket_id: String = args[0].clone().try_into()?;
         let interval = validate::get_timeinterval(env)?;
 
-        let events = match ds.get_events(
+        let mut filters = Vec::new();
+        if args.len() > 1 {
+            let filter_list: Vec<DataType> = args[1].clone().try_into()?;
+            for filter_val in filter_list {
+                if let DataType::Dict(mut d) = filter_val {
+                    let key: String = d
+                        .remove("key")
+                        .ok_or_else(|| {
+                            QueryError::InvalidFunctionParameters(
+                                "query_bucket filter is missing 'key'".to_string(),
+                            )
+                        })?
+                        .try_into()?;
+                    let vals: Vec<DataType> = d
+                        .remove("vals")
+                        .ok_or_else(|| {
+                            QueryError::InvalidFunctionParameters(
+                                "query_bucket filter is missing 'vals'".to_string(),
+                            )
+                        })?
+                        .try_into()?;
+
+                    let mut json_vals = Vec::new();
+                    for v in vals {
+                        match v {
+                            DataType::String(s) => json_vals.push(serde_json::Value::String(s)),
+                            DataType::Number(n) => {
+                                let num = serde_json::Number::from_f64(n).ok_or_else(|| {
+                                    QueryError::InvalidFunctionParameters(format!(
+                                        "query_bucket filter value is not a finite number: {n}"
+                                    ))
+                                })?;
+                                json_vals.push(serde_json::Value::Number(num));
+                            }
+                            DataType::Bool(b) => json_vals.push(serde_json::Value::Bool(b)),
+                            _ => {}
+                        }
+                    }
+                    filters.push(aw_datastore::EventFilter {
+                        key,
+                        vals: json_vals,
+                    });
+                }
+            }
+        }
+
+        let events = match ds.get_events_filtered(
             bucket_id.as_str(),
             Some(*interval.start()),
             Some(*interval.end()),
             None,
+            &filters,
         ) {
             Ok(events) => events,
             Err(e) => {
@@ -164,9 +229,80 @@ mod qfunctions {
         for event in events {
             ret.push(DataType::Event(event));
         }
+
         Ok(DataType::List(ret))
     }
 
+    pub fn query_bucket_grouped(
+        args: Vec<DataType>,
+        env: &VarEnv,
+        ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        // Typecheck
+        validate::args_length(&args, 2)?;
+
+        let bucket_id: String = args[0].clone().try_into()?;
+        let group_by_key: String = args[1].clone().try_into()?;
+        let interval = validate::get_timeinterval(env)?;
+
+        let events = match ds.get_events_grouped(
+            bucket_id.as_str(),
+            Some(*interval.start()),
+            Some(*interval.end()),
+            &group_by_key,
+        ) {
+            Ok(events) => events,
+            Err(e) => {
+                return Err(QueryError::BucketQueryError(format!(
+                    "Failed to query bucket grouped: {e:?}"
+                )))
+            }
+        };
+
+        let mut ret = Vec::new();
+        for event in events {
+            ret.push(DataType::Event(event));
+        }
+
+        Ok(DataType::List(ret))
+    }
+    pub fn query_bucket_intersected(
+        args: Vec<DataType>,
+        env: &VarEnv,
+        ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        // Typecheck
+        validate::args_length(&args, 4)?;
+
+        let target_bucket_id: String = args[0].clone().try_into()?;
+        let filter_bucket_id: String = args[1].clone().try_into()?;
+        let filter_key: String = args[2].clone().try_into()?;
+        let filter_val: serde_json::Value = args[3].clone().try_into()?;
+        let interval = validate::get_timeinterval(env)?;
+
+        let events = match ds.get_events_intersected(
+            target_bucket_id.as_str(),
+            filter_bucket_id.as_str(),
+            Some(*interval.start()),
+            Some(*interval.end()),
+            &filter_key,
+            &filter_val,
+        ) {
+            Ok(events) => events,
+            Err(e) => {
+                return Err(QueryError::BucketQueryError(format!(
+                    "Failed to query bucket intersected: {e:?}"
+                )))
+            }
+        };
+
+        let mut ret = Vec::new();
+        for event in events {
+            ret.push(DataType::Event(event));
+        }
+
+        Ok(DataType::List(ret))
+    }
     pub fn query_bucket_names(
         args: Vec<DataType>,
         _env: &VarEnv,

@@ -103,10 +103,14 @@ pub fn get_log_dir(module: &str) -> Result<PathBuf, ()> {
 
 pub fn db_path(testing: bool) -> Result<PathBuf, ()> {
     let mut db_path = get_data_dir()?;
+    // DuckDB backend uses its own filename: pointing DuckDB at an existing
+    // SQLite-format `sqlite*.db` makes it open in SQLite-compatibility mode
+    // (which can't create sequences). A separate file also keeps the old SQLite
+    // database intact alongside the fresh DuckDB one.
     if testing {
-        db_path.push("sqlite-testing.db");
+        db_path.push("duckdb-testing.db");
     } else {
-        db_path.push("sqlite.db");
+        db_path.push("duckdb.db");
     }
     Ok(db_path)
 }

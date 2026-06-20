@@ -72,24 +72,12 @@ struct Opts {
     /// Don't import from aw-server-python if no aw-server-rust db found
     #[clap(long)]
     no_legacy_import: bool,
-
-    /// Encryption key for the database (requires 'encryption' feature).
-    /// Can also be set via the AW_DB_PASSWORD environment variable.
-    /// WARNING: passing a password on the command line may expose it in process listings.
-    #[clap(long, env = "AW_DB_PASSWORD")]
-    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    db_password: Option<String>,
 }
 
 #[rocket::main]
 #[allow(clippy::result_large_err)]
 async fn main() -> Result<(), rocket::Error> {
     let opts: Opts = Opts::parse();
-
-    // Clear sensitive env vars immediately after parse, before setup_logger can start
-    // background threads (std::env::remove_var is not thread-safe on all platforms).
-    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    std::env::remove_var("AW_DB_PASSWORD");
 
     let mut testing = opts.testing;
 
@@ -152,6 +140,27 @@ async fn main() -> Result<(), rocket::Error> {
     };
     info!("Using DB at path {:?}", db_path);
 
+    // The DuckDB backend uses a new database file and does not read the old
+    // SQLite database. Warn (rather than silently start empty) if a legacy
+    // sqlite.db is still sitting next to it, so users notice their old history
+    // is not being migrated.
+    if opts.dbpath.is_none() {
+        if let Ok(data_dir) = dirs::get_data_dir() {
+            let legacy_db = data_dir.join(if testing {
+                "sqlite-testing.db"
+            } else {
+                "sqlite.db"
+            });
+            if legacy_db.exists() {
+                warn!(
+                    "A legacy SQLite database exists at {:?} but the DuckDB backend does not read it; \
+                     its history will not appear. The file is left untouched.",
+                    legacy_db
+                );
+            }
+        }
+    }
+
     let asset_path = opts.webpath.map(PathBuf::from);
     info!("Using aw-webui assets at path {:?}", asset_path);
 
@@ -167,31 +176,14 @@ async fn main() -> Result<(), rocket::Error> {
         device_id::get_device_id()
     };
 
-    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    let datastore = match opts.db_password {
-        Some(key) if key.is_empty() => {
-            // SQLCipher silently treats PRAGMA key '' as no encryption — reject early so
-            // callers don't end up with a plaintext database while believing it is encrypted.
-            panic!("--db-password / AW_DB_PASSWORD must not be empty; aborting to prevent silent plaintext storage");
-        }
-        Some(key) => {
-            info!("Using encrypted database (SQLCipher)");
-            aw_datastore::Datastore::new_encrypted(db_path, key, legacy_import)
-        }
-        None => aw_datastore::Datastore::new(db_path, legacy_import),
-    };
-    #[cfg(not(any(feature = "encryption", feature = "encryption-vendored")))]
-    {
-        if std::env::var("AW_DB_PASSWORD").is_ok() {
-            panic!(
-                "AW_DB_PASSWORD is set but this binary was not compiled with encryption support. \
-                 Refusing to start with an unencrypted database when the user requested encryption. \
-                 Rebuild with the 'encryption' or 'encryption-vendored' feature, or unset \
-                 AW_DB_PASSWORD to use an unencrypted database."
-            );
-        }
+    // Encryption is not supported on the DuckDB backend. Refuse to start if a
+    // password was requested rather than silently writing a plaintext database.
+    if std::env::var_os("AW_DB_PASSWORD").is_some() {
+        panic!(
+            "AW_DB_PASSWORD is set but database encryption is not supported on this build. \
+             Unset AW_DB_PASSWORD to use an unencrypted database."
+        );
     }
-    #[cfg(not(any(feature = "encryption", feature = "encryption-vendored")))]
     let datastore = aw_datastore::Datastore::new(db_path, legacy_import);
 
     let server_state = endpoints::ServerState {

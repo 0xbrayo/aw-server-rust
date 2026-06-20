@@ -4,7 +4,9 @@ use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
 
-use rusqlite::Connection;
+use duckdb::params;
+use duckdb::types::ToSql;
+use duckdb::Connection;
 
 use serde_json::value::Value;
 
@@ -12,199 +14,613 @@ use aw_models::Bucket;
 use aw_models::BucketMetadata;
 use aw_models::Event;
 
-use rusqlite::params;
-use rusqlite::types::ToSql;
-
 use super::DatastoreError;
 
-fn _get_db_version(conn: &Connection) -> i32 {
-    conn.pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap()
+/// Parse an event's `data` JSON object.
+///
+/// This runs once per event returned from a query, so it dominates the cost of
+/// reading large time ranges. On 64-bit x86/ARM we use the SIMD-accelerated
+/// sonic-rs parser; other targets fall back to serde_json. Both produce an
+/// identical `serde_json::Map`, so callers and the on-disk format are
+/// unaffected. The error is normalised to a String so the call sites are
+/// arch-independent.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn parse_event_data(data_str: &str) -> Result<serde_json::Map<String, Value>, String> {
+    sonic_rs::from_str(data_str).map_err(|e| e.to_string())
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn parse_event_data(data_str: &str) -> Result<serde_json::Map<String, Value>, String> {
+    serde_json::from_str(data_str).map_err(|e| e.to_string())
+}
+
+/// Build the DuckDB JSON-extraction SQL fragment for a top-level event-data key,
+/// escaping it for safe inlining into a JSON path string. `data` is stored as
+/// VARCHAR; DuckDB implicitly casts it to JSON for `json_extract_string`.
+fn json_extract_expr(column: &str, key: &str) -> String {
+    // Escape backslashes and double quotes for the quoted JSON path member, and
+    // single quotes for the surrounding SQL string literal.
+    let escaped = key
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\'', "''");
+    format!("json_extract_string({column}, '$.\"{escaped}\"')")
+}
+
+// === Event read queries ===
+//
+// These are free functions taking a `&Connection` and a resolved bucket row id
+// (`bid`) so they can run on either the worker's write connection (via the
+// `DatastoreInstance` methods below, which look up `bid` from the bucket cache)
+// or a separate read-only connection (via `worker::Reader`, which looks up
+// `bid` with `query_bid`). Keeping the SQL and row parsing in one place means
+// both paths stay byte-for-byte identical.
+
+/// Build an `Event` from a `(id, starttime, endtime, data)` row. When `clip` is
+/// set, the event's start/end are clamped to `[clip_start_ns, clip_end_ns]`.
+fn event_from_row(
+    row: &duckdb::Row,
+    clip_start_ns: i64,
+    clip_end_ns: i64,
+    clip: bool,
+) -> duckdb::Result<Event> {
+    let id: i64 = row.get(0)?;
+    let mut starttime_ns: i64 = row.get(1)?;
+    let mut endtime_ns: i64 = row.get(2)?;
+    let data_str: String = row.get(3)?;
+
+    if clip {
+        if starttime_ns < clip_start_ns {
+            starttime_ns = clip_start_ns;
+        }
+        if endtime_ns > clip_end_ns {
+            endtime_ns = clip_end_ns;
+        }
+    }
+    let duration_ns = endtime_ns - starttime_ns;
+    let time_seconds: i64 = starttime_ns / 1_000_000_000;
+    let time_subnanos: u32 = (starttime_ns % 1_000_000_000) as u32;
+    let data = parse_event_data(&data_str)
+        .map_err(|e| duckdb::Error::InvalidColumnName(format!("invalid event data JSON: {e}")))?;
+
+    Ok(Event {
+        id: Some(id),
+        timestamp: DateTime::from_timestamp(time_seconds, time_subnanos).unwrap(),
+        duration: Duration::nanoseconds(duration_ns),
+        data,
+    })
+}
+
+/// Resolve a bucket's integer row id by name. Used by the read-only connection
+/// path, which has no access to the worker's in-memory bucket cache.
+pub(crate) fn query_bid(conn: &Connection, bucket_id: &str) -> Result<i64, DatastoreError> {
+    let mut stmt = conn
+        .prepare_cached("SELECT id FROM buckets WHERE name = ?")
+        .map_err(|err| {
+            DatastoreError::InternalError(format!("Failed to prepare bucket id lookup: {err}"))
+        })?;
+    match stmt.query_row([bucket_id], |row| row.get(0)) {
+        Ok(bid) => Ok(bid),
+        Err(duckdb::Error::QueryReturnedNoRows) => {
+            Err(DatastoreError::NoSuchBucket(bucket_id.to_string()))
+        }
+        Err(err) => Err(DatastoreError::InternalError(format!(
+            "Failed to look up bucket id for {bucket_id}: {err}"
+        ))),
+    }
+}
+
+pub(crate) fn query_event(
+    conn: &Connection,
+    bid: i64,
+    event_id: i64,
+) -> Result<Event, DatastoreError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "
+                SELECT id, starttime, endtime, data
+                FROM events
+                WHERE bucketrow = ?
+                    AND id = ?
+                LIMIT 1
+            ;",
+        )
+        .map_err(|err| {
+            DatastoreError::InternalError(format!(
+                "Failed to prepare get_event SQL statement: {err}"
+            ))
+        })?;
+    stmt.query_row([&bid, &event_id], |row| event_from_row(row, 0, 0, false))
+        .map_err(|err| {
+            DatastoreError::InternalError(format!("Failed to map get_event SQL statement: {err}"))
+        })
+}
+
+pub(crate) fn query_events(
+    conn: &Connection,
+    bid: i64,
+    bucket_id: &str,
+    starttime_opt: Option<DateTime<Utc>>,
+    endtime_opt: Option<DateTime<Utc>>,
+    limit_opt: Option<u64>,
+    clip_to_query_range: bool,
+    filters: Option<&[crate::EventFilter]>,
+) -> Result<Vec<Event>, DatastoreError> {
+    let mut list = Vec::new();
+
+    let starttime_filter_ns: i64 = match starttime_opt {
+        Some(dt) => dt.timestamp_nanos_opt().unwrap(),
+        None => 0,
+    };
+    let endtime_filter_ns: i64 = match endtime_opt {
+        Some(dt) => dt.timestamp_nanos_opt().unwrap(),
+        None => std::i64::MAX,
+    };
+    if starttime_filter_ns > endtime_filter_ns {
+        warn!("Starttime in event query was lower than endtime!");
+        return Ok(list);
+    }
+    let limit = match limit_opt {
+        Some(l) => l as i64,
+        None => -1,
+    };
+
+    let has_filters = filters.map(|f| !f.is_empty()).unwrap_or(false);
+
+    if !has_filters {
+        // DuckDB has no "LIMIT -1"; an absent limit is expressed with a NULL
+        // bound parameter (DuckDB treats LIMIT NULL as no limit).
+        let limit_param: Option<i64> = if limit < 0 { None } else { Some(limit) };
+        let mut stmt = conn
+            .prepare_cached(
+                "
+                    SELECT id, starttime, endtime, data
+                    FROM events
+                    WHERE bucketrow = ?
+                        AND endtime >= ?
+                        AND starttime <= ?
+                    ORDER BY starttime DESC, id ASC
+                    LIMIT ?
+                ;",
+            )
+            .map_err(|err| {
+                DatastoreError::InternalError(format!(
+                    "Failed to prepare get_events SQL statement: {err}"
+                ))
+            })?;
+
+        let rows = stmt
+            .query_map(
+                params![bid, starttime_filter_ns, endtime_filter_ns, limit_param],
+                |row| {
+                    event_from_row(
+                        row,
+                        starttime_filter_ns,
+                        endtime_filter_ns,
+                        clip_to_query_range,
+                    )
+                },
+            )
+            .map_err(|err| {
+                DatastoreError::InternalError(format!(
+                    "Failed to map get_events SQL statement: {err}"
+                ))
+            })?;
+
+        for row in rows {
+            match row {
+                Ok(event) => list.push(event),
+                Err(err) => warn!("Corrupt event in bucket {}: {}", bucket_id, err),
+            };
+        }
+    } else {
+        let mut sql = "SELECT id, starttime, endtime, data FROM events WHERE bucketrow = ? AND endtime >= ? AND starttime <= ?".to_string();
+        let mut params: Vec<Box<dyn ToSql>> = vec![
+            Box::new(bid),
+            Box::new(starttime_filter_ns),
+            Box::new(endtime_filter_ns),
+        ];
+
+        for filter in filters.unwrap() {
+            if filter.vals.is_empty() {
+                sql.push_str(" AND 1=0");
+                continue;
+            }
+            sql.push_str(&format!(
+                " AND {} IN (",
+                json_extract_expr("data", &filter.key)
+            ));
+            for (i, val) in filter.vals.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+
+                // json_extract_string yields text, so compare every value as its
+                // string form. Binding numbers/bools as native SQL types instead
+                // would force a fragile VARCHAR-vs-BIGINT cast and diverge from
+                // query_events_intersected, which also stringifies.
+                let sql_val: String = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                params.push(Box::new(sql_val));
+            }
+            sql.push(')');
+        }
+
+        // json_extract_string returns text, so values are compared as strings.
+        sql.push_str(" ORDER BY starttime DESC, id ASC LIMIT ?");
+        let limit_param: Option<i64> = if limit < 0 { None } else { Some(limit) };
+        params.push(Box::new(limit_param));
+
+        let mut stmt = conn.prepare(&sql).map_err(|err| {
+            DatastoreError::InternalError(format!(
+                "Failed to prepare get_events SQL statement: {err}"
+            ))
+        })?;
+
+        let params_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                event_from_row(
+                    row,
+                    starttime_filter_ns,
+                    endtime_filter_ns,
+                    clip_to_query_range,
+                )
+            })
+            .map_err(|err| {
+                DatastoreError::InternalError(format!(
+                    "Failed to map get_events SQL statement: {err}"
+                ))
+            })?;
+
+        for row in rows {
+            match row {
+                Ok(event) => list.push(event),
+                Err(err) => warn!("Corrupt event in bucket {}: {}", bucket_id, err),
+            };
+        }
+    }
+
+    Ok(list)
+}
+
+pub(crate) fn query_events_grouped(
+    conn: &Connection,
+    bid: i64,
+    bucket_id: &str,
+    starttime_opt: Option<DateTime<Utc>>,
+    endtime_opt: Option<DateTime<Utc>>,
+    group_by_key: &str,
+) -> Result<Vec<Event>, DatastoreError> {
+    let mut list = Vec::new();
+
+    let starttime_filter_ns: i64 = match starttime_opt {
+        Some(dt) => dt.timestamp_nanos_opt().unwrap(),
+        None => 0,
+    };
+    let endtime_filter_ns: i64 = match endtime_opt {
+        Some(dt) => dt.timestamp_nanos_opt().unwrap(),
+        None => std::i64::MAX,
+    };
+
+    if starttime_filter_ns > endtime_filter_ns {
+        warn!("Starttime in event query was lower than endtime!");
+        return Ok(list);
+    }
+
+    let sql = format!(
+        // DuckDB's sum() over a BIGINT column returns HUGEINT (i128); cast back
+        // to BIGINT so the row reads as i64. A bucket's total duration in
+        // nanoseconds cannot overflow i64 (~292 years), so the cast is safe.
+        "SELECT
+            min(starttime) as starttime,
+            CAST(sum(endtime - starttime) AS BIGINT) as duration_ns,
+            {} as group_val
+        FROM events
+        WHERE bucketrow = ? AND endtime >= ? AND starttime <= ?
+        GROUP BY group_val
+        ORDER BY duration_ns DESC",
+        json_extract_expr("data", group_by_key)
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|err| {
+        DatastoreError::InternalError(format!(
+            "Failed to prepare query_events_grouped SQL statement: {err}"
+        ))
+    })?;
+
+    let rows = stmt
+        .query_map([&bid, &starttime_filter_ns, &endtime_filter_ns], |row| {
+            let starttime_ns: i64 = row.get(0)?;
+            let duration_ns: i64 = row.get(1)?;
+            let group_val: Option<String> = row.get(2)?;
+
+            let time_seconds: i64 = starttime_ns / 1_000_000_000;
+            let time_subnanos: u32 = (starttime_ns % 1_000_000_000) as u32;
+
+            let mut data_map = serde_json::Map::new();
+            if let Some(val) = group_val {
+                data_map.insert(group_by_key.to_string(), serde_json::Value::String(val));
+            } else {
+                data_map.insert(group_by_key.to_string(), serde_json::Value::Null);
+            }
+
+            Ok(Event {
+                id: None,
+                timestamp: DateTime::from_timestamp(time_seconds, time_subnanos).unwrap(),
+                duration: Duration::nanoseconds(duration_ns),
+                data: data_map,
+            })
+        })
+        .map_err(|err| {
+            DatastoreError::InternalError(format!(
+                "Failed to map query_events_grouped SQL statement: {err}"
+            ))
+        })?;
+
+    for row in rows {
+        match row {
+            Ok(event) => list.push(event),
+            Err(err) => warn!("Corrupt grouped event in bucket {}: {}", bucket_id, err),
+        };
+    }
+
+    Ok(list)
+}
+
+pub(crate) fn query_events_intersected(
+    conn: &Connection,
+    target_bid: i64,
+    filter_bid: i64,
+    target_bucket_id: &str,
+    starttime_opt: Option<DateTime<Utc>>,
+    endtime_opt: Option<DateTime<Utc>>,
+    filter_key: &str,
+    filter_val: &serde_json::Value,
+) -> Result<Vec<Event>, DatastoreError> {
+    let mut list = Vec::new();
+
+    let starttime_filter_ns: i64 = match starttime_opt {
+        Some(dt) => dt.timestamp_nanos_opt().unwrap(),
+        None => 0,
+    };
+    let endtime_filter_ns: i64 = match endtime_opt {
+        Some(dt) => dt.timestamp_nanos_opt().unwrap(),
+        None => std::i64::MAX,
+    };
+
+    if starttime_filter_ns > endtime_filter_ns {
+        warn!("Starttime in event query was lower than endtime!");
+        return Ok(list);
+    }
+
+    let sql = format!(
+        "SELECT
+            window.id,
+            greatest(window.starttime, afk.starttime) as intersect_start,
+            least(window.endtime, afk.endtime) as intersect_end,
+            window.data
+        FROM events window
+        JOIN events afk ON
+            window.bucketrow = ?
+            AND afk.bucketrow = ?
+            AND window.starttime < afk.endtime
+            AND window.endtime > afk.starttime
+            AND {} = ?
+        WHERE greatest(window.starttime, afk.starttime) < least(window.endtime, afk.endtime)
+           AND window.endtime >= ?
+           AND window.starttime <= ?
+        ORDER BY intersect_start ASC",
+        json_extract_expr("afk.data", filter_key)
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|err| {
+        DatastoreError::InternalError(format!(
+            "Failed to prepare query_events_intersected SQL statement: {err}"
+        ))
+    })?;
+
+    // json_extract_string returns text, so the filter value is compared as a string.
+    let filter_val_str: String = match filter_val {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    };
+
+    let params: [&dyn ToSql; 5] = [
+        &target_bid,
+        &filter_bid,
+        &filter_val_str,
+        &starttime_filter_ns,
+        &endtime_filter_ns,
+    ];
+
+    let rows = stmt
+        .query_map(params, |row| {
+            let id: i64 = row.get(0)?;
+            let starttime_ns: i64 = row.get(1)?;
+            let endtime_ns: i64 = row.get(2)?;
+            let data_str: String = row.get(3)?;
+
+            let time_seconds: i64 = starttime_ns / 1_000_000_000;
+            let time_subnanos: u32 = (starttime_ns % 1_000_000_000) as u32;
+            let duration_ns: i64 = endtime_ns - starttime_ns;
+
+            let data = parse_event_data(&data_str).unwrap_or_default();
+
+            Ok(Event {
+                id: Some(id),
+                timestamp: DateTime::from_timestamp(time_seconds, time_subnanos).unwrap(),
+                duration: Duration::nanoseconds(duration_ns),
+                data,
+            })
+        })
+        .map_err(|err| {
+            DatastoreError::InternalError(format!(
+                "Failed to map query_events_intersected SQL statement: {err}"
+            ))
+        })?;
+
+    for row in rows {
+        match row {
+            Ok(event) => list.push(event),
+            Err(err) => warn!(
+                "Corrupt intersected event in bucket {}: {}",
+                target_bucket_id, err
+            ),
+        };
+    }
+
+    Ok(list)
+}
+
+pub(crate) fn query_event_count(
+    conn: &Connection,
+    bid: i64,
+    starttime_opt: Option<DateTime<Utc>>,
+    endtime_opt: Option<DateTime<Utc>>,
+) -> Result<i64, DatastoreError> {
+    let starttime_filter_ns: i64 = match starttime_opt {
+        Some(dt) => dt.timestamp_nanos_opt().unwrap(),
+        None => 0,
+    };
+    let endtime_filter_ns: i64 = match endtime_opt {
+        Some(dt) => dt.timestamp_nanos_opt().unwrap(),
+        None => std::i64::MAX,
+    };
+    if starttime_filter_ns >= endtime_filter_ns {
+        warn!("Endtime in event query was same or lower than starttime!");
+        return Ok(0);
+    }
+
+    let mut stmt = conn
+        .prepare_cached(
+            "
+            SELECT count(*) FROM events
+            WHERE bucketrow = ?
+                AND endtime >= ?
+                AND starttime <= ?",
+        )
+        .map_err(|err| {
+            DatastoreError::InternalError(format!(
+                "Failed to prepare get_event_count SQL statement: {err}",
+            ))
+        })?;
+
+    stmt.query_row([&bid, &starttime_filter_ns, &endtime_filter_ns], |row| {
+        row.get(0)
+    })
+    .map_err(|err| {
+        DatastoreError::InternalError(format!(
+            "Failed to query get_event_count SQL statement: {err}"
+        ))
+    })
 }
 
 /*
- * ### Database version changelog ###
- * 0: Uninitialized database
- * 1: Initialized database
- * 2: Added 'data' field to 'buckets' table
- * 3: see: https://github.com/ActivityWatch/aw-server-rust/pull/52
- * 4: Added 'key_value' table for storing key - value pairs
- * 5: Replaced single-column events indexes with a composite index
+ * ### Schema notes (DuckDB) ###
+ * The old SQLite `user_version` migration ladder is gone: DuckDB has no
+ * per-database user_version pragma and this backend starts from a fresh schema
+ * (no migration from the SQLite databases). `db_version` is kept on
+ * `DatastoreInstance` for API compatibility and pinned to NEWEST_DB_VERSION.
  */
 static NEWEST_DB_VERSION: i32 = 5;
 
-fn _create_tables(conn: &Connection, version: i32) -> bool {
-    let mut first_init = false;
-
-    if version < 1 {
-        first_init = true;
-        _migrate_v0_to_v1(conn);
-    }
-
-    if version < 2 {
-        _migrate_v1_to_v2(conn);
-    }
-
-    if version < 3 {
-        _migrate_v2_to_v3(conn);
-    }
-
-    if version < 4 {
-        _migrate_v3_to_v4(conn);
-    }
-
-    if version < 5 {
-        _migrate_v4_to_v5(conn);
-    }
-
-    first_init
-}
-
-fn _migrate_v0_to_v1(conn: &Connection) {
-    /* Set up bucket table */
-    conn.execute(
-        "
-        CREATE TABLE IF NOT EXISTS buckets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            type TEXT NOT NULL,
-            client TEXT NOT NULL,
-            hostname TEXT NOT NULL,
-            created TEXT NOT NULL
-        )",
-        &[] as &[&dyn ToSql],
-    )
-    .expect("Failed to create buckets table");
-
-    /* Set up index for bucket table */
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS bucket_id_index ON buckets(id)",
-        &[] as &[&dyn ToSql],
-    )
-    .expect("Failed to create buckets index");
-
-    /* Set up events table */
-    conn.execute(
-        "
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bucketrow INTEGER NOT NULL,
-            starttime INTEGER NOT NULL,
-            endtime INTEGER NOT NULL,
-            data TEXT NOT NULL,
-            FOREIGN KEY (bucketrow) REFERENCES buckets(id)
-        )",
-        &[] as &[&dyn ToSql],
-    )
-    .expect("Failed to create events table");
-
-    /* Set up index for events table */
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS events_bucketrow_index ON events(bucketrow)",
-        &[] as &[&dyn ToSql],
-    )
-    .expect("Failed to create events_bucketrow index");
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS events_starttime_index ON events(starttime)",
-        &[] as &[&dyn ToSql],
-    )
-    .expect("Failed to create events_starttime index");
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS events_endtime_index ON events(endtime)",
-        &[] as &[&dyn ToSql],
-    )
-    .expect("Failed to create events_endtime index");
-
-    /* Update database version */
-    conn.pragma_update(None, "user_version", 1)
-        .expect("Failed to update database version!");
-}
-
-fn _migrate_v1_to_v2(conn: &Connection) {
-    info!("Upgrading database to v2, adding data field to buckets");
-    conn.execute(
-        "ALTER TABLE buckets ADD COLUMN data TEXT DEFAULT '{}';",
-        &[] as &[&dyn ToSql],
-    )
-    .expect("Failed to upgrade database when adding data field to buckets");
-
-    conn.pragma_update(None, "user_version", 2)
-        .expect("Failed to update database version!");
-}
-
-fn _migrate_v2_to_v3(conn: &Connection) {
-    // For details about why this migration was necessary, see: https://github.com/ActivityWatch/aw-server-rust/pull/52
-    info!("Upgrading database to v3, replacing the broken data field for buckets");
-
-    // Rename column, marking it as deprecated
-    match conn.execute(
-        "ALTER TABLE buckets RENAME COLUMN data TO data_deprecated;",
-        &[] as &[&dyn ToSql],
-    ) {
-        Ok(_) => (),
-        // This error is okay, it still has the intended effects
-        Err(rusqlite::Error::ExecuteReturnedResults) => (),
-        Err(e) => panic!("Unexpected error: {e:?}"),
-    };
-
-    // Create new correct column
-    conn.execute(
-        "ALTER TABLE buckets ADD COLUMN data TEXT NOT NULL DEFAULT '{}';",
-        &[] as &[&dyn ToSql],
-    )
-    .expect("Failed to upgrade database when adding new data field to buckets");
-
-    conn.pragma_update(None, "user_version", 3)
-        .expect("Failed to update database version!");
-}
-
-fn _migrate_v3_to_v4(conn: &Connection) {
-    info!("Upgrading database to v4, adding table for key-value storage");
-    conn.execute(
-        "CREATE TABLE key_value (
-        key TEXT PRIMARY KEY,
-        value TEXT,
-        last_modified NUMBER NOT NULL
-    );",
-        [],
-    )
-    .expect("Failed to upgrade db and add key-value storage table");
-
-    conn.pragma_update(None, "user_version", 4)
-        .expect("Failed to update database version!");
-}
-
-fn _migrate_v4_to_v5(conn: &Connection) {
-    info!(
-        "Upgrading database to v5, replacing single-column events indexes with a composite index"
-    );
-    // Every event query filters on bucketrow and a starttime/endtime range,
-    // ordered by starttime. A composite index serves the seek, the range scan
-    // and the ORDER BY in one pass (with endtime checked from the index
-    // without fetching the row), where the single-column indexes could only
-    // cover one predicate and left the rest as scan + sort. Dropping them
-    // also makes inserts cheaper (one index to maintain instead of three).
-    //
-    // starttime is DESC so a forward scan yields the query's newest-first
-    // order with equal-timestamp events in rowid (insertion) order, matching
-    // the ordering callers observed before this index existed.
-    //
-    // The drops run before the create so the pages they free are reused to
-    // build the new index within the same transaction; creating first would
-    // permanently grow the database file by the new index's size.
+/// Create the schema if absent. Auto-increment ids come from DuckDB sequences
+/// (there is no AUTOINCREMENT); timestamps are stored as nanosecond BIGINTs and
+/// `data` as VARCHAR (JSON text), matching the values bound from Rust.
+fn _create_tables(conn: &Connection) -> Result<(), DatastoreError> {
     conn.execute_batch(
         "
-        BEGIN EXCLUSIVE TRANSACTION;
-        DROP INDEX IF EXISTS events_bucketrow_index;
-        DROP INDEX IF EXISTS events_starttime_index;
-        DROP INDEX IF EXISTS events_endtime_index;
-        CREATE INDEX IF NOT EXISTS events_bucketrow_starttime_endtime_index
-            ON events(bucketrow, starttime DESC, endtime);
-        PRAGMA user_version = 5;
-        COMMIT;
-    ",
+        CREATE SEQUENCE IF NOT EXISTS seq_bucket_id START 1;
+        CREATE TABLE IF NOT EXISTS buckets (
+            id BIGINT PRIMARY KEY DEFAULT nextval('seq_bucket_id'),
+            name VARCHAR UNIQUE NOT NULL,
+            \"type\" VARCHAR NOT NULL,
+            client VARCHAR NOT NULL,
+            hostname VARCHAR NOT NULL,
+            created VARCHAR NOT NULL,
+            data VARCHAR NOT NULL DEFAULT '{}'
+        );
+        CREATE SEQUENCE IF NOT EXISTS seq_event_id START 1;
+        CREATE TABLE IF NOT EXISTS events (
+            id BIGINT PRIMARY KEY DEFAULT nextval('seq_event_id'),
+            bucketrow BIGINT NOT NULL,
+            starttime BIGINT NOT NULL,
+            endtime BIGINT NOT NULL,
+            data VARCHAR NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS key_value (
+            key VARCHAR PRIMARY KEY,
+            value VARCHAR,
+            last_modified BIGINT NOT NULL
+        );
+        -- Serves the per-bucket newest-first range scan every event read does
+        -- (WHERE bucketrow=? AND endtime>=? AND starttime<=? ORDER BY starttime).
+        CREATE INDEX IF NOT EXISTS events_bucketrow_starttime
+            ON events (bucketrow, starttime, endtime);
+        ",
     )
-    .expect("Failed to run v5 migration transaction");
+    .map_err(|err| DatastoreError::InternalError(format!("Failed to create DuckDB schema: {err}")))
+}
+
+/// Realign the id sequences with the largest id already stored.
+///
+/// Ids assigned explicitly (e.g. events arriving from sync/import via
+/// `INSERT OR REPLACE`) do not advance the `nextval` sequence, so after such a
+/// load the sequence can still hand out an already-used id and collide on the
+/// primary key. DuckDB has no `setval`/`ALTER SEQUENCE RESTART`, and
+/// `CREATE OR REPLACE SEQUENCE` is refused while a table default depends on the
+/// sequence, so advance `nextval` (which is allowed) until it is past the
+/// largest stored id. Gaps in the id space are harmless.
+fn _resync_sequences(conn: &Connection) -> Result<(), DatastoreError> {
+    for (seq, table) in [("seq_bucket_id", "buckets"), ("seq_event_id", "events")] {
+        let max_id: i64 = conn
+            .query_row(
+                &format!("SELECT coalesce(max(id), 0) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| {
+                DatastoreError::InternalError(format!("Failed to read max id from {table}: {err}"))
+            })?;
+        if max_id == 0 {
+            // Empty table: the freshly created sequence already starts at 1.
+            continue;
+        }
+        let cur: i64 = conn
+            .query_row(&format!("SELECT nextval('{seq}')"), [], |row| row.get(0))
+            .map_err(|err| {
+                DatastoreError::InternalError(format!("Failed to read sequence {seq}: {err}"))
+            })?;
+        if cur < max_id {
+            // Consume the (max_id - cur) values between here and max_id in one
+            // query so the next nextval yields max_id + 1.
+            conn.execute_batch(&format!(
+                "SELECT nextval('{seq}') FROM range({});",
+                max_id - cur
+            ))
+            .map_err(|err| {
+                DatastoreError::InternalError(format!("Failed to advance sequence {seq}: {err}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the `buckets` table already exists, used to decide first-init.
+fn _buckets_table_exists(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'buckets'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
 }
 
 pub struct DatastoreInstance {
@@ -218,27 +634,24 @@ impl DatastoreInstance {
         conn: &Connection,
         migrate_enabled: bool,
     ) -> Result<DatastoreInstance, DatastoreError> {
-        let mut first_init = false;
-        let db_version = _get_db_version(conn);
+        let existed = _buckets_table_exists(conn);
+        let first_init = !existed;
 
         if migrate_enabled {
-            first_init = _create_tables(conn, db_version);
-        } else if db_version < 0 {
+            _create_tables(conn)?;
+            // An existing database may already hold rows with higher ids than the
+            // (freshly re-created) sequences would produce; realign them.
+            _resync_sequences(conn)?;
+        } else if !existed {
             return Err(DatastoreError::Uninitialized(
                 "Tried to open an uninitialized datastore with migration disabled".to_string(),
             ));
-        } else if db_version != NEWEST_DB_VERSION {
-            return Err(DatastoreError::OldDbVersion(format!(
-                "\
-                Tried to open an database with an incompatible database version!
-                Database has version {db_version} while the supported version is {NEWEST_DB_VERSION}"
-            )));
         }
 
         let mut ds = DatastoreInstance {
             buckets_cache: HashMap::new(),
             first_init,
-            db_version,
+            db_version: NEWEST_DB_VERSION,
         };
         ds.get_stored_buckets(conn)?;
         Ok(ds)
@@ -247,13 +660,13 @@ impl DatastoreInstance {
     fn get_stored_buckets(&mut self, conn: &Connection) -> Result<(), DatastoreError> {
         let mut stmt = match conn.prepare_cached(
             "
-            SELECT  buckets.id, buckets.name, buckets.type, buckets.client,
+            SELECT  buckets.id, buckets.name, buckets.\"type\", buckets.client,
                     buckets.hostname, buckets.created,
                     min(events.starttime), max(events.endtime),
                     buckets.data
             FROM buckets
             LEFT OUTER JOIN events ON buckets.id = events.bucketrow
-            GROUP BY buckets.id
+            GROUP BY ALL
             ;",
         ) {
             Ok(stmt) => stmt,
@@ -263,7 +676,7 @@ impl DatastoreInstance {
                 )))
             }
         };
-        let buckets = match stmt.query_map(&[] as &[&dyn ToSql], |row| {
+        let buckets = match stmt.query_map([], |row| {
             let opt_start_ns: Option<i64> = row.get(6)?;
             let opt_start = match opt_start_ns {
                 Some(starttime_ns) => {
@@ -289,11 +702,19 @@ impl DatastoreInstance {
             let data_json = match serde_json::from_str(&data_str) {
                 Ok(data) => data,
                 Err(e) => {
-                    return Err(rusqlite::Error::InvalidColumnName(format!(
+                    return Err(duckdb::Error::InvalidColumnName(format!(
                         "Failed to parse data to JSON: {e:?}"
                     )))
                 }
             };
+
+            // `created` is stored as an RFC3339 string.
+            let created_str: String = row.get(5)?;
+            let created = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    duckdb::Error::InvalidColumnName(format!("Failed to parse created: {e:?}"))
+                })?;
 
             Ok(Bucket {
                 bid: row.get(0)?,
@@ -301,7 +722,7 @@ impl DatastoreInstance {
                 _type: row.get(2)?,
                 client: row.get(3)?,
                 hostname: row.get(4)?,
-                created: row.get(5)?,
+                created: Some(created),
                 data: data_json,
                 metadata: BucketMetadata {
                     start: opt_start,
@@ -325,7 +746,7 @@ impl DatastoreInstance {
                 }
                 Err(e) => {
                     return Err(DatastoreError::InternalError(format!(
-                        "Failed to parse bucket from SQLite, database is corrupt! {e:?}"
+                        "Failed to parse bucket from DuckDB, database is corrupt! {e:?}"
                     )))
                 }
             }
@@ -358,37 +779,47 @@ impl DatastoreInstance {
         conn: &Connection,
         mut bucket: Bucket,
     ) -> Result<(), DatastoreError> {
+        // The cache is authoritative for existence; checking it here avoids
+        // relying on DuckDB-specific constraint-violation error matching.
+        if self.buckets_cache.contains_key(&bucket.id) {
+            return Err(DatastoreError::BucketAlreadyExists(bucket.id.to_string()));
+        }
+
         bucket.created = match bucket.created {
             Some(created) => Some(created),
             None => Some(Utc::now()),
         };
+        let created_str = bucket.created.unwrap().to_rfc3339();
+        let data = serde_json::to_string(&bucket.data).unwrap();
+
         let mut stmt = match conn.prepare_cached(
             "
-                INSERT INTO buckets (name, type, client, hostname, created, data)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                INSERT INTO buckets (name, \"type\", client, hostname, created, data)
+                VALUES (?, ?, ?, ?, ?, ?)
+                RETURNING id",
         ) {
-            Ok(buckets) => buckets,
+            Ok(stmt) => stmt,
             Err(err) => {
                 return Err(DatastoreError::InternalError(format!(
                     "Failed to prepare create_bucket SQL statement: {err}"
                 )))
             }
         };
-        let data = serde_json::to_string(&bucket.data).unwrap();
-        let res = stmt.execute([
-            &bucket.id,
-            &bucket._type,
-            &bucket.client,
-            &bucket.hostname,
-            &bucket.created as &dyn ToSql,
-            &data,
-        ]);
+        let rowid: Result<i64, duckdb::Error> = stmt.query_row(
+            params![
+                bucket.id,
+                bucket._type,
+                bucket.client,
+                bucket.hostname,
+                created_str,
+                data,
+            ],
+            |row| row.get(0),
+        );
 
-        match res {
-            Ok(_) => {
+        match rowid {
+            Ok(rowid) => {
                 info!("Created bucket {}", bucket.id);
-                // Get and set rowid
-                let rowid: i64 = conn.last_insert_rowid();
                 bucket.bid = Some(rowid);
                 // Take out events from struct before caching
                 let events = bucket.events;
@@ -402,20 +833,9 @@ impl DatastoreInstance {
                 }
                 Ok(())
             }
-            // FIXME: This match is ugly, is it possible to write it in a cleaner way?
-            Err(err) => match err {
-                rusqlite::Error::SqliteFailure { 0: sqlerr, 1: _ } => match sqlerr.code {
-                    rusqlite::ErrorCode::ConstraintViolation => {
-                        Err(DatastoreError::BucketAlreadyExists(bucket.id.to_string()))
-                    }
-                    _ => Err(DatastoreError::InternalError(format!(
-                        "Failed to execute create_bucket SQL statement: {err}"
-                    ))),
-                },
-                _ => Err(DatastoreError::InternalError(format!(
-                    "Failed to execute create_bucket SQL statement: {err}"
-                ))),
-            },
+            Err(err) => Err(DatastoreError::InternalError(format!(
+                "Failed to execute create_bucket SQL statement: {err}"
+            ))),
         }
     }
 
@@ -426,25 +846,17 @@ impl DatastoreInstance {
     ) -> Result<(), DatastoreError> {
         let bucket = (self.get_bucket(bucket_id))?;
         // Delete all events in bucket
-        match conn.execute("DELETE FROM events WHERE bucketrow = ?1", [&bucket.bid]) {
+        match conn.execute("DELETE FROM events WHERE bucketrow = ?", [&bucket.bid]) {
             Ok(_) => (),
             Err(err) => return Err(DatastoreError::InternalError(err.to_string())),
         }
         // Delete bucket itself
-        match conn.execute("DELETE FROM buckets WHERE id = ?1", [&bucket.bid]) {
+        match conn.execute("DELETE FROM buckets WHERE id = ?", [&bucket.bid]) {
             Ok(_) => {
                 self.buckets_cache.remove(bucket_id);
                 Ok(())
             }
-            Err(err) => match err {
-                rusqlite::Error::SqliteFailure { 0: sqlerr, 1: _ } => match sqlerr.code {
-                    rusqlite::ErrorCode::ConstraintViolation => {
-                        Err(DatastoreError::BucketAlreadyExists(bucket_id.to_string()))
-                    }
-                    _ => Err(DatastoreError::InternalError(err.to_string())),
-                },
-                _ => Err(DatastoreError::InternalError(err.to_string())),
-            },
+            Err(err) => Err(DatastoreError::InternalError(err.to_string())),
         }
     }
 
@@ -467,19 +879,9 @@ impl DatastoreInstance {
         mut events: Vec<Event>,
     ) -> Result<Vec<Event>, DatastoreError> {
         let mut bucket = self.get_bucket(bucket_id)?;
+        let bid = bucket.bid.unwrap();
+        let mut saw_explicit_id = false;
 
-        let mut stmt = match conn.prepare_cached(
-            "
-                INSERT OR REPLACE INTO events(bucketrow, id, starttime, endtime, data)
-                VALUES (?1, ?2, ?3, ?4, ?5)",
-        ) {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to prepare insert_events SQL statement: {err}"
-                )))
-            }
-        };
         for event in &mut events {
             let starttime_nanos = event.timestamp.timestamp_nanos_opt().unwrap();
             let duration_nanos = match event.duration.num_nanoseconds() {
@@ -492,18 +894,35 @@ impl DatastoreInstance {
             };
             let endtime_nanos = starttime_nanos + duration_nanos;
             let data = serde_json::to_string(&event.data).unwrap();
-            let res = stmt.execute([
-                &bucket.bid.unwrap(),
-                &event.id as &dyn ToSql,
-                &starttime_nanos,
-                &endtime_nanos,
-                &data as &dyn ToSql,
-            ]);
-            match res {
-                Ok(_) => {
+
+            // New events let the sequence assign the id; events that arrive with
+            // an explicit id (e.g. from sync/import) upsert on the primary key.
+            let new_id: Result<i64, duckdb::Error> = match event.id {
+                Some(id) => {
+                    saw_explicit_id = true;
+                    let mut stmt = conn.prepare_cached(
+                        "INSERT OR REPLACE INTO events(id, bucketrow, starttime, endtime, data)
+                         VALUES (?, ?, ?, ?, ?) RETURNING id",
+                    )?;
+                    stmt.query_row(
+                        params![id, bid, starttime_nanos, endtime_nanos, data],
+                        |row| row.get(0),
+                    )
+                }
+                None => {
+                    let mut stmt = conn.prepare_cached(
+                        "INSERT INTO events(bucketrow, starttime, endtime, data)
+                         VALUES (?, ?, ?, ?) RETURNING id",
+                    )?;
+                    stmt.query_row(params![bid, starttime_nanos, endtime_nanos, data], |row| {
+                        row.get(0)
+                    })
+                }
+            };
+            match new_id {
+                Ok(id) => {
                     self.update_endtime(&mut bucket, event);
-                    let rowid = conn.last_insert_rowid();
-                    event.id = Some(rowid);
+                    event.id = Some(id);
                 }
                 Err(err) => {
                     return Err(DatastoreError::InternalError(format!(
@@ -511,6 +930,11 @@ impl DatastoreInstance {
                     )));
                 }
             };
+        }
+        // Explicit ids bypass the sequence, so realign it to avoid a later
+        // auto-id insert colliding on the primary key.
+        if saw_explicit_id {
+            _resync_sequences(conn)?;
         }
         Ok(events)
     }
@@ -522,20 +946,21 @@ impl DatastoreInstance {
         event_ids: Vec<i64>,
     ) -> Result<(), DatastoreError> {
         let bucket = self.get_bucket(bucket_id)?;
+        let bid = bucket.bid.unwrap();
         let mut stmt = match conn.prepare_cached(
             "
                 DELETE FROM events
-                WHERE bucketrow = ?1 AND id = ?2",
+                WHERE bucketrow = ? AND id = ?",
         ) {
             Ok(stmt) => stmt,
             Err(err) => {
                 return Err(DatastoreError::InternalError(format!(
-                    "Failed to prepare insert_events SQL statement: {err}"
+                    "Failed to prepare delete_events SQL statement: {err}"
                 )))
             }
         };
         for id in event_ids {
-            let res = stmt.execute([&bucket.bid.unwrap(), &id as &dyn ToSql]);
+            let res = stmt.execute(params![bid, id]);
             match res {
                 Ok(_) => {}
                 Err(err) => {
@@ -579,7 +1004,7 @@ impl DatastoreInstance {
                 }
             }
         }
-        /* Update buchets_cache if start or end has been updated */
+        /* Update buckets_cache if start or end has been updated */
         if update {
             self.buckets_cache.insert(bucket.id.clone(), bucket.clone());
         }
@@ -593,13 +1018,14 @@ impl DatastoreInstance {
         event: &Event,
     ) -> Result<(), DatastoreError> {
         let mut bucket = self.get_bucket(bucket_id)?;
+        let bid = bucket.bid.unwrap();
 
         // Use event ID directly instead of max(endtime) to avoid mismatch with get_events ordering
         let mut stmt = match conn.prepare_cached(
             "
                 UPDATE events
-                SET starttime = ?2, endtime = ?3, data = ?4
-                WHERE bucketrow = ?1 AND id = ?5
+                SET starttime = ?, endtime = ?, data = ?
+                WHERE bucketrow = ? AND id = ?
             ",
         ) {
             Ok(stmt) => stmt,
@@ -620,26 +1046,18 @@ impl DatastoreInstance {
         };
         let endtime_nanos = starttime_nanos + duration_nanos;
         let data = serde_json::to_string(&event.data).unwrap();
-        match stmt.execute([
-            &bucket.bid.unwrap(),
-            &starttime_nanos,
-            &endtime_nanos,
-            &data as &dyn ToSql,
-            &event_id,
-        ]) {
-            Ok(0) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "replace_last_event matched 0 rows for event_id {event_id} - cache/DB inconsistency"
-                )))
+        match stmt.execute(params![starttime_nanos, endtime_nanos, data, bid, event_id]) {
+            Ok(0) => Err(DatastoreError::InternalError(format!(
+                "replace_last_event matched 0 rows for event_id {event_id} - cache/DB inconsistency"
+            ))),
+            Ok(_) => {
+                self.update_endtime(&mut bucket, event);
+                Ok(())
             }
-            Ok(_) => self.update_endtime(&mut bucket, event),
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to execute replace_last_event SQL statement: {err}"
-                )))
-            }
-        };
-        Ok(())
+            Err(err) => Err(DatastoreError::InternalError(format!(
+                "Failed to execute replace_last_event SQL statement: {err}"
+            ))),
+        }
     }
 
     pub fn heartbeat(
@@ -701,54 +1119,8 @@ impl DatastoreInstance {
         bucket_id: &str,
         event_id: i64,
     ) -> Result<Event, DatastoreError> {
-        let bucket = self.get_bucket(bucket_id)?;
-
-        let mut stmt = match conn.prepare_cached(
-            "
-                SELECT id, starttime, endtime, data
-                FROM events
-                WHERE bucketrow = ?1
-                    AND id = ?2
-                LIMIT 1
-            ;",
-        ) {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to prepare get_event SQL statement: {err}"
-                )))
-            }
-        };
-
-        // TODO: Refactor to share row-parsing logic with get_events
-        let row = match stmt.query_row([&bucket.bid.unwrap(), &event_id], |row| {
-            let id = row.get(0)?;
-            let starttime_ns: i64 = row.get(1)?;
-            let endtime_ns: i64 = row.get(2)?;
-            let data_str: String = row.get(3)?;
-
-            let time_seconds: i64 = starttime_ns / 1_000_000_000;
-            let time_subnanos: u32 = (starttime_ns % 1_000_000_000) as u32;
-            let duration_ns = endtime_ns - starttime_ns;
-            let data: serde_json::map::Map<String, Value> =
-                serde_json::from_str(&data_str).unwrap();
-
-            Ok(Event {
-                id: Some(id),
-                timestamp: DateTime::from_timestamp(time_seconds, time_subnanos).unwrap(),
-                duration: Duration::nanoseconds(duration_ns),
-                data,
-            })
-        }) {
-            Ok(rows) => rows,
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to map get_event SQL statement: {err}"
-                )))
-            }
-        };
-
-        Ok(row)
+        let bid = self.get_bucket(bucket_id)?.bid.unwrap();
+        query_event(conn, bid, event_id)
     }
 
     fn get_events_inner(
@@ -760,97 +1132,17 @@ impl DatastoreInstance {
         limit_opt: Option<u64>,
         clip_to_query_range: bool,
     ) -> Result<Vec<Event>, DatastoreError> {
-        let bucket = self.get_bucket(bucket_id)?;
-
-        let mut list = Vec::new();
-
-        let starttime_filter_ns: i64 = match starttime_opt {
-            Some(dt) => dt.timestamp_nanos_opt().unwrap(),
-            None => 0,
-        };
-        let endtime_filter_ns: i64 = match endtime_opt {
-            Some(dt) => dt.timestamp_nanos_opt().unwrap(),
-            None => std::i64::MAX,
-        };
-        if starttime_filter_ns > endtime_filter_ns {
-            warn!("Starttime in event query was lower than endtime!");
-            return Ok(list);
-        }
-        let limit = match limit_opt {
-            Some(l) => l as i64,
-            None => -1,
-        };
-
-        let mut stmt = match conn.prepare_cached(
-            "
-                SELECT id, starttime, endtime, data
-                FROM events
-                WHERE bucketrow = ?1
-                    AND endtime >= ?2
-                    AND starttime <= ?3
-                ORDER BY starttime DESC
-                LIMIT ?4
-            ;",
-        ) {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to prepare get_events SQL statement: {err}"
-                )))
-            }
-        };
-
-        let rows = match stmt.query_map(
-            [
-                &bucket.bid.unwrap(),
-                &starttime_filter_ns,
-                &endtime_filter_ns,
-                &limit,
-            ],
-            |row| {
-                let id = row.get(0)?;
-                let mut starttime_ns: i64 = row.get(1)?;
-                let mut endtime_ns: i64 = row.get(2)?;
-                let data_str: String = row.get(3)?;
-
-                if clip_to_query_range {
-                    if starttime_ns < starttime_filter_ns {
-                        starttime_ns = starttime_filter_ns
-                    }
-                    if endtime_ns > endtime_filter_ns {
-                        endtime_ns = endtime_filter_ns
-                    }
-                }
-                let duration_ns = endtime_ns - starttime_ns;
-
-                let time_seconds: i64 = starttime_ns / 1_000_000_000;
-                let time_subnanos: u32 = (starttime_ns % 1_000_000_000) as u32;
-                let data: serde_json::map::Map<String, Value> =
-                    serde_json::from_str(&data_str).unwrap();
-
-                Ok(Event {
-                    id: Some(id),
-                    timestamp: DateTime::from_timestamp(time_seconds, time_subnanos).unwrap(),
-                    duration: Duration::nanoseconds(duration_ns),
-                    data,
-                })
-            },
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to map get_events SQL statement: {err}"
-                )))
-            }
-        };
-        for row in rows {
-            match row {
-                Ok(event) => list.push(event),
-                Err(err) => warn!("Corrupt event in bucket {}: {}", bucket_id, err),
-            };
-        }
-
-        Ok(list)
+        let bid = self.get_bucket(bucket_id)?.bid.unwrap();
+        query_events(
+            conn,
+            bid,
+            bucket_id,
+            starttime_opt,
+            endtime_opt,
+            limit_opt,
+            clip_to_query_range,
+            None,
+        )
     }
 
     pub fn get_events(
@@ -882,6 +1174,71 @@ impl DatastoreInstance {
         )
     }
 
+    pub fn get_events_filtered(
+        &mut self,
+        conn: &Connection,
+        bucket_id: &str,
+        starttime_opt: Option<DateTime<Utc>>,
+        endtime_opt: Option<DateTime<Utc>>,
+        limit_opt: Option<u64>,
+        filters: &[crate::EventFilter],
+    ) -> Result<Vec<Event>, DatastoreError> {
+        let bid = self.get_bucket(bucket_id)?.bid.unwrap();
+        query_events(
+            conn,
+            bid,
+            bucket_id,
+            starttime_opt,
+            endtime_opt,
+            limit_opt,
+            true,
+            Some(filters),
+        )
+    }
+
+    pub fn get_events_grouped(
+        &mut self,
+        conn: &Connection,
+        bucket_id: &str,
+        starttime_opt: Option<DateTime<Utc>>,
+        endtime_opt: Option<DateTime<Utc>>,
+        group_by_key: &str,
+    ) -> Result<Vec<Event>, DatastoreError> {
+        let bid = self.get_bucket(bucket_id)?.bid.unwrap();
+        query_events_grouped(
+            conn,
+            bid,
+            bucket_id,
+            starttime_opt,
+            endtime_opt,
+            group_by_key,
+        )
+    }
+
+    pub fn get_events_intersected(
+        &mut self,
+        conn: &Connection,
+        target_bucket_id: &str,
+        filter_bucket_id: &str,
+        starttime_opt: Option<DateTime<Utc>>,
+        endtime_opt: Option<DateTime<Utc>>,
+        filter_key: &str,
+        filter_val: &serde_json::Value,
+    ) -> Result<Vec<Event>, DatastoreError> {
+        let target_bid = self.get_bucket(target_bucket_id)?.bid.unwrap();
+        let filter_bid = self.get_bucket(filter_bucket_id)?.bid.unwrap();
+        query_events_intersected(
+            conn,
+            target_bid,
+            filter_bid,
+            target_bucket_id,
+            starttime_opt,
+            endtime_opt,
+            filter_key,
+            filter_val,
+        )
+    }
+
     pub fn get_event_count(
         &self,
         conn: &Connection,
@@ -889,53 +1246,8 @@ impl DatastoreInstance {
         starttime_opt: Option<DateTime<Utc>>,
         endtime_opt: Option<DateTime<Utc>>,
     ) -> Result<i64, DatastoreError> {
-        let bucket = self.get_bucket(bucket_id)?;
-
-        let starttime_filter_ns: i64 = match starttime_opt {
-            Some(dt) => dt.timestamp_nanos_opt().unwrap(),
-            None => 0,
-        };
-        let endtime_filter_ns: i64 = match endtime_opt {
-            Some(dt) => dt.timestamp_nanos_opt().unwrap(),
-            None => std::i64::MAX,
-        };
-        if starttime_filter_ns >= endtime_filter_ns {
-            warn!("Endtime in event query was same or lower than starttime!");
-            return Ok(0);
-        }
-
-        let mut stmt = match conn.prepare_cached(
-            "
-            SELECT count(*) FROM events
-            WHERE bucketrow = ?1
-                AND endtime >= ?2
-                AND starttime <= ?3",
-        ) {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to prepare get_event_count SQL statement: {err}",
-                )))
-            }
-        };
-
-        let count = match stmt.query_row(
-            [
-                &bucket.bid.unwrap(),
-                &starttime_filter_ns,
-                &endtime_filter_ns,
-            ],
-            |row| row.get(0),
-        ) {
-            Ok(count) => count,
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to query get_event_count SQL statement: {err}"
-                )))
-            }
-        };
-
-        Ok(count)
+        let bid = self.get_bucket(bucket_id)?.bid.unwrap();
+        query_event_count(conn, bid, starttime_opt, endtime_opt)
     }
 
     pub fn insert_key_value(
@@ -947,7 +1259,7 @@ impl DatastoreInstance {
         let mut stmt = match conn.prepare_cached(
             "
                 INSERT OR REPLACE INTO key_value(key, value, last_modified)
-                VALUES (?1, ?2, ?3)",
+                VALUES (?, ?, ?)",
         ) {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -958,22 +1270,19 @@ impl DatastoreInstance {
         };
         let timestamp = Utc::now().timestamp();
         #[allow(clippy::expect_fun_call)]
-        stmt.execute(params![key, data, &timestamp])
+        stmt.execute(params![key, data, timestamp])
             .expect(&format!("Failed to insert key-value pair: {key}"));
         Ok(())
     }
 
     pub fn delete_key_value(&self, conn: &Connection, key: &str) -> Result<(), DatastoreError> {
-        conn.execute("DELETE FROM key_value WHERE key = ?1", [key])
+        conn.execute("DELETE FROM key_value WHERE key = ?", [key])
             .expect("Error deleting value from database");
         Ok(())
     }
 
     pub fn get_key_value(&self, conn: &Connection, key: &str) -> Result<String, DatastoreError> {
-        let mut stmt = match conn.prepare_cached(
-            "
-                SELECT * FROM key_value WHERE KEY = ?1",
-        ) {
+        let mut stmt = match conn.prepare_cached("SELECT value FROM key_value WHERE key = ?") {
             Ok(stmt) => stmt,
             Err(err) => {
                 return Err(DatastoreError::InternalError(format!(
@@ -982,10 +1291,10 @@ impl DatastoreInstance {
             }
         };
 
-        match stmt.query_row([key], |row| row.get(1)) {
+        match stmt.query_row([key], |row| row.get(0)) {
             Ok(result) => Ok(result),
             Err(err) => match err {
-                rusqlite::Error::QueryReturnedNoRows => {
+                duckdb::Error::QueryReturnedNoRows => {
                     Err(DatastoreError::NoSuchKey(key.to_string()))
                 }
                 _ => Err(DatastoreError::InternalError(format!(
@@ -1011,7 +1320,6 @@ impl DatastoreInstance {
             };
 
         let mut output = HashMap::<String, String>::new();
-        // Rusqlite's get wants index and item type as parameters.
         let result = stmt.query_map([pattern], |row| {
             Ok((row.get::<usize, String>(0)?, row.get::<usize, String>(1)?))
         });
@@ -1030,7 +1338,7 @@ impl DatastoreInstance {
                 Ok(output)
             }
             Err(err) => match err {
-                rusqlite::Error::QueryReturnedNoRows => Ok(output),
+                duckdb::Error::QueryReturnedNoRows => Ok(output),
                 _ => Err(DatastoreError::InternalError(
                     "Failed to get settings".to_string(),
                 )),

@@ -56,6 +56,17 @@ fn import(datastore: &Datastore, import: BucketsExport) -> Result<(), HttpErrorJ
                             .max()
                             .unwrap();
 
+                        // Reads go through a pool that sees only committed data,
+                        // while writes batch uncommitted for up to ~15s. Flush
+                        // pending writes first so a prior import in the same window
+                        // is visible here and we don't re-insert its events.
+                        if let Err(e) = datastore.force_commit() {
+                            return Err(HttpErrorJson::new(
+                                Status::InternalServerError,
+                                format!("Failed to flush datastore before dedup: {e:?}"),
+                            ));
+                        }
+
                         // Fetch existing events in that range to detect duplicates.
                         // Events without an explicit ID would otherwise be inserted as new rows
                         // via AUTOINCREMENT, silently creating duplicates on re-import.

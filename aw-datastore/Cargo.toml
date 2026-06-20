@@ -5,15 +5,11 @@ authors = ["Johan Bjäreholt <johan@bjareho.lt>"]
 edition = "2021"
 
 [features]
-default = ["bundled"]
-# Use bundled SQLite (default, no encryption support)
-bundled = ["rusqlite/bundled"]
-# Use bundled SQLCipher for encrypted databases (mutually exclusive with 'bundled')
-# Build with: cargo build --no-default-features --features encryption
-# Requires OpenSSL. Use 'encryption-vendored' to vendor OpenSSL as well.
-encryption = ["rusqlite/bundled-sqlcipher", "dep:zeroize"]
-# Like 'encryption' but also vendors OpenSSL (fully self-contained)
-encryption-vendored = ["rusqlite/bundled-sqlcipher-vendored-openssl", "dep:zeroize"]
+# Default links the system libduckdb (see .cargo/config DUCKDB_LIB_DIR). Enable
+# `bundled` to compile a self-contained DuckDB engine from source instead.
+default = []
+bundled = ["duckdb/bundled"]
+# Encryption is not supported on the DuckDB backend.
 legacy_import_tests = []
 
 [dependencies]
@@ -21,15 +17,16 @@ dirs = "6"
 serde = "1.0"
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.30", features = ["chrono", "serde_json"] }
+duckdb = { version = "1", features = ["chrono"] }
 mpsc_requests = "0.3"
 log = "0.4"
-zeroize = { version = "1", optional = true, features = ["alloc"] }
 
 aw-models = { path = "../aw-models" }
 aw-transform = { path = "../aw-transform" }
 regex = "1"
 
-[dev-dependencies]
-# Used by migration tests to construct databases with old schema versions
-rusqlite = { version = "0.30", features = ["chrono", "serde_json"] }
+# SIMD-accelerated JSON parser for the hot event-read path. Only has SIMD
+# backends for 64-bit x86/ARM; other targets (e.g. 32-bit ARM) fall back to
+# serde_json in code, so the dependency is gated to the arches it supports.
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+sonic-rs = "0.3"

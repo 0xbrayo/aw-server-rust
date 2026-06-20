@@ -25,14 +25,16 @@ mod worker;
 pub use self::datastore::DatastoreInstance;
 pub use self::worker::Datastore;
 
+#[derive(Clone, Debug)]
+pub struct EventFilter {
+    pub key: String,
+    pub vals: Vec<serde_json::Value>,
+}
+
 #[derive(Clone)]
 pub enum DatastoreMethod {
     Memory(),
     File(String),
-    /// Encrypted SQLite file using SQLCipher. Only available with the
-    /// `encryption` or `encryption-vendored` feature flags.
-    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    FileEncrypted(String, zeroize::Zeroizing<String>), // (path, key)
 }
 
 impl fmt::Debug for DatastoreMethod {
@@ -40,8 +42,6 @@ impl fmt::Debug for DatastoreMethod {
         match self {
             DatastoreMethod::Memory() => write!(f, "Memory()"),
             DatastoreMethod::File(p) => write!(f, "File({p:?})"),
-            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-            DatastoreMethod::FileEncrypted(p, _) => write!(f, "FileEncrypted({p:?}, <redacted>)"),
         }
     }
 }
@@ -57,4 +57,10 @@ pub enum DatastoreError {
     // Errors specific to when migrate is disabled
     Uninitialized(String),
     OldDbVersion(String),
+}
+
+impl From<duckdb::Error> for DatastoreError {
+    fn from(err: duckdb::Error) -> Self {
+        DatastoreError::InternalError(err.to_string())
+    }
 }
