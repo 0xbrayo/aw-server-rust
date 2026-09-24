@@ -95,6 +95,15 @@ impl MockServer {
         let requests = self.requests.lock().unwrap();
         requests.iter().map(|(line, _)| line.clone()).collect()
     }
+
+    /// Request lines other than `/api/0/info`, which the worker may or may not send
+    /// before a test registers its buckets.
+    fn bucket_request_lines(&self) -> Vec<String> {
+        self.request_lines()
+            .into_iter()
+            .filter(|line| !line.contains("/api/0/info"))
+            .collect()
+    }
 }
 
 impl Drop for MockServer {
@@ -168,7 +177,14 @@ fn creates_registered_buckets_then_delivers_heartbeats_in_order() {
     assert!(queue.is_connected());
     queue.stop();
 
-    let requests = server.requests.lock().unwrap().clone();
+    let requests: Vec<_> = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(line, _)| !line.contains("/api/0/info"))
+        .cloned()
+        .collect();
     let lines: Vec<_> = requests.iter().map(|(line, _)| line.as_str()).collect();
     assert_eq!(
         lines,
@@ -359,7 +375,7 @@ fn a_missing_bucket_is_recreated_and_temporary_errors_retried() {
     queue.stop();
 
     assert_eq!(
-        server.request_lines(),
+        server.bucket_request_lines(),
         vec![
             "POST /api/0/buckets/window HTTP/1.1",
             "POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1",
