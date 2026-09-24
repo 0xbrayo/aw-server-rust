@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aw_client_rust::blocking::AwClient;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::sync::is_synced_bucket_id;
 use crate::util::{format_bytes, inspect_sync_db, scan_sync_dir, SyncEntryKind};
@@ -33,6 +33,8 @@ pub struct PruneTarget {
     pub db_size: u64,
     /// `(bucket id, event count)`, in the order sqlite returned them.
     pub buckets: Vec<(String, i64)>,
+    /// An earlier prune committed its deletes but its `VACUUM` did not run.
+    pub vacuum_pending: bool,
     /// Bytes on sqlite's freelist that `VACUUM` would give back.
     pub reclaimable: u64,
 }
@@ -45,18 +47,14 @@ pub struct PruneOutcome {
     pub size_after: u64,
 }
 
-/// A db whose freelist is at least 1/`RECLAIM_RATIO` of the file is worth a
-/// `VACUUM` even with nothing left to delete. Append-only staging almost never
-/// gets there on its own; a prune whose `VACUUM` failed (e.g. a daemon pass
-/// held the lock) does, so the next run retries it.
-const RECLAIM_RATIO: u64 = 10;
+/// `key_value` row a prune writes in the same transaction as its deletes and
+/// removes once `VACUUM` succeeds. While it is set the db stays a target, so a
+/// `VACUUM` that failed (e.g. a daemon pass held the lock) is retried by the
+/// next run, without vacuuming dbs that cleanup never touched.
+const VACUUM_PENDING_KEY: &str = "aw-sync.clean-legacy.vacuum-pending";
 
-fn needs_vacuum(reclaimable: u64, db_size: u64) -> bool {
-    reclaimable > 0 && reclaimable.saturating_mul(RECLAIM_RATIO) >= db_size
-}
-
-/// Own staging databases that hold `-synced-from-` buckets or are left
-/// oversized by an earlier prune.
+/// Own staging databases that hold `-synced-from-` buckets or have a `VACUUM`
+/// pending from an earlier prune.
 ///
 /// Returns the targets plus one message per own staging database that was
 /// skipped (could not be inspected, or resolves through a symlink); those are
@@ -78,10 +76,12 @@ pub fn find_prune_targets(
             errors.push(e);
             continue;
         }
-        let inspected = inspect_sync_db(&db_path)
-            .and_then(|info| reclaimable_bytes(&db_path).map(|r| (info, r)));
+        let inspected = inspect_sync_db(&db_path).and_then(|info| {
+            let pending = vacuum_pending(&db_path)?;
+            Ok((info, pending, reclaimable_bytes(&db_path)?))
+        });
         match inspected {
-            Ok((info, reclaimable)) => {
+            Ok((info, vacuum_pending, reclaimable)) => {
                 let buckets: Vec<(String, i64)> = info
                     .buckets
                     .into_iter()
@@ -89,11 +89,12 @@ pub fn find_prune_targets(
                     .map(|b| (b.id, b.event_count))
                     .collect();
                 let db_size = entry.db_size.unwrap_or(0);
-                if !buckets.is_empty() || needs_vacuum(reclaimable, db_size) {
+                if !buckets.is_empty() || vacuum_pending {
                     targets.push(PruneTarget {
                         db_path,
                         db_size,
                         buckets,
+                        vacuum_pending,
                         reclaimable,
                     });
                 }
@@ -130,6 +131,25 @@ fn ensure_no_symlink(sync_dir: &Path, db_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn vacuum_pending(db_path: &Path) -> Result<bool, String> {
+    let err = |e: rusqlite::Error| format!("{}: {e}", db_path.display());
+    let conn =
+        Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+    match conn
+        .query_row(
+            "SELECT 1 FROM key_value WHERE key = ?1",
+            [VACUUM_PENDING_KEY],
+            |_| Ok(()),
+        )
+        .optional()
+    {
+        Ok(found) => Ok(found.is_some()),
+        // Pre-v4 schema without key_value: no prune has ever run on it.
+        Err(e) if e.to_string().contains("no such table") => Ok(false),
+        Err(e) => Err(err(e)),
+    }
+}
+
 fn reclaimable_bytes(db_path: &Path) -> Result<u64, String> {
     let err = |e: rusqlite::Error| format!("{}: {e}", db_path.display());
     let conn =
@@ -148,8 +168,8 @@ fn reclaimable_bytes(db_path: &Path) -> Result<u64, String> {
 ///
 /// Refuses any id without the `-synced-from-` marker, so a caller bug cannot
 /// delete first-hand data, and any path that resolves through a symlink.
-/// Ids that are already gone are skipped, and `VACUUM` runs whenever the
-/// freelist is non-empty, so a re-run after an interrupted prune finishes it.
+/// Ids that are already gone are skipped, and a `VACUUM` left pending by an
+/// earlier run is retried, so a re-run after an interrupted prune finishes it.
 pub fn prune_synced_buckets(
     sync_dir: &Path,
     db_path: &Path,
@@ -192,12 +212,16 @@ pub fn prune_synced_buckets(
             .map_err(open_err)?;
         outcome.buckets += 1;
     }
+    if outcome.buckets > 0 {
+        tx.execute(
+            "INSERT OR REPLACE INTO key_value(key, value, last_modified) VALUES (?1, '1', ?2)",
+            params![VACUUM_PENDING_KEY, chrono::Utc::now().timestamp()],
+        )
+        .map_err(open_err)?;
+    }
     tx.commit().map_err(open_err)?;
 
-    let free_pages: i64 = conn
-        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
-        .map_err(open_err)?;
-    if free_pages > 0 {
+    if outcome.buckets > 0 || vacuum_pending(db_path)? {
         conn.execute_batch("VACUUM").map_err(|e| {
             format!(
                 "{}: VACUUM failed ({e}); deleted buckets stay deleted but the file will not \
@@ -205,6 +229,8 @@ pub fn prune_synced_buckets(
                 db_path.display()
             )
         })?;
+        conn.execute("DELETE FROM key_value WHERE key = ?1", [VACUUM_PENDING_KEY])
+            .map_err(open_err)?;
     }
     // Closing the last connection checkpoints the WAL back into the main
     // file, so what the syncer copies next is self-contained.
@@ -509,7 +535,8 @@ mod tests {
             let conn = Connection::open(&own).unwrap();
             conn.execute_batch(&format!(
                 "DELETE FROM events WHERE bucketrow = (SELECT id FROM buckets WHERE name = '{REEXPORT}');
-                 DELETE FROM buckets WHERE name = '{REEXPORT}';"
+                 DELETE FROM buckets WHERE name = '{REEXPORT}';
+                 INSERT INTO key_value(key, value, last_modified) VALUES ('{VACUUM_PENDING_KEY}', '1', 0);"
             ))
             .unwrap();
         }
@@ -522,8 +549,26 @@ mod tests {
         let mut out = Vec::new();
         clean_legacy(&root, LOCAL, false, &mut out).unwrap();
         assert_eq!(reclaimable_bytes(&own).unwrap(), 0);
+        assert!(!vacuum_pending(&own).unwrap());
         let (targets, _) = find_prune_targets(&root, LOCAL).unwrap();
         assert!(targets.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn free_pages_without_pending_marker_are_left_alone() {
+        let root = temp_sync_dir();
+        let own = root.join(LOCAL).join("test.db");
+        staging_db(&own, &[OWN], 2000);
+        // Ordinary deletes (not by cleanup) leave a large freelist.
+        {
+            let conn = Connection::open(&own).unwrap();
+            conn.execute_batch("DELETE FROM events").unwrap();
+        }
+        assert!(reclaimable_bytes(&own).unwrap() > 0);
+
+        let (targets, skipped) = find_prune_targets(&root, LOCAL).unwrap();
+        assert!(targets.is_empty() && skipped.is_empty(), "{targets:?}");
         let _ = fs::remove_dir_all(&root);
     }
 
