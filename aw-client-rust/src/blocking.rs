@@ -41,6 +41,15 @@ impl AwClient {
         Self::new_with_api_key(host, port, name, None)
     }
 
+    pub fn from_config(
+        name: &str,
+        testing: bool,
+        api_key: Option<String>,
+    ) -> Result<AwClient, Box<dyn Error>> {
+        let config = crate::config::load_config(testing);
+        Self::new_with_api_key(&config.hostname, config.port, name, api_key)
+    }
+
     pub fn new_with_api_key(
         host: &str,
         port: u16,
