@@ -124,6 +124,9 @@ struct State {
     /// Set when a bucket is registered or goes missing, so it's created before the next
     /// delivery.
     buckets_pending: bool,
+    /// Buckets the server refused to create (a 4xx); their heartbeats are dropped rather
+    /// than blocking the rest of the queue.
+    rejected_buckets: Vec<String>,
     connected: bool,
     stop: bool,
 }
@@ -223,6 +226,7 @@ impl RequestQueue {
                 log,
                 buckets_pending: !buckets.is_empty(),
                 buckets,
+                rejected_buckets: Vec::new(),
                 connected: false,
                 stop: false,
             }),
@@ -246,6 +250,8 @@ impl RequestQueue {
         if !state.buckets.contains(&entry) {
             state.buckets.push(entry);
         }
+        // Registering again (e.g. after fixing the hostname) gives it another try.
+        state.rejected_buckets.retain(|id| id != bucket_id);
         state.buckets_pending = true;
         drop(state);
         self.shared.wake.notify_all();
@@ -362,15 +368,30 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
         };
 
         if !connected || buckets_pending {
+            let mut rejected = Vec::new();
             let created = runtime.block_on(async {
                 if buckets.is_empty() {
                     return transport.ping().await;
                 }
                 for (bucket_id, event_type) in &buckets {
-                    transport.create_bucket(bucket_id, event_type).await?;
+                    match transport.create_bucket(bucket_id, event_type).await {
+                        Ok(()) => {}
+                        // The server refuses this bucket (e.g. an invalid hostname), so
+                        // retrying won't help; don't let it hold up the other buckets.
+                        Err(err) if err.status().is_some_and(|s| s.is_client_error()) => {
+                            log::error!("Server refused to create bucket {bucket_id}: {err}");
+                            rejected.push(bucket_id.clone());
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
                 Ok(())
             });
+            if !rejected.is_empty() {
+                let mut state = shared.lock();
+                state.buckets.retain(|(id, _)| !rejected.contains(id));
+                state.rejected_buckets.extend(rejected.iter().cloned());
+            }
             match created {
                 Ok(()) => {
                     let mut state = shared.lock();
@@ -379,7 +400,7 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
                     }
                     state.connected = true;
                     // A bucket registered while we were creating the others is still pending.
-                    state.buckets_pending = state.buckets.len() != buckets.len();
+                    state.buckets_pending = state.buckets.len() != buckets.len() - rejected.len();
                 }
                 Err(err) => {
                     let queued = {
@@ -404,9 +425,11 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
             continue;
         };
 
+        let mut failure = None;
         let delivery = match runtime.block_on(transport.heartbeat(&request)) {
             Ok(()) => Delivery::Sent,
             Err(err) => {
+                failure = Some(err.to_string());
                 let delivery = classify(&err);
                 match delivery {
                     Delivery::Disconnected => log::warn!(
@@ -424,7 +447,9 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
 
         let delivery = if delivery == Delivery::MissingBucket {
             let mut state = shared.lock();
-            if state.bucket_type(&request.bucket_id).is_some() {
+            if state.rejected_buckets.contains(&request.bucket_id) {
+                Delivery::Drop
+            } else if state.bucket_type(&request.bucket_id).is_some() {
                 // Recreate it (and any other registered bucket) before retrying.
                 log::warn!("Bucket {} is missing, recreating it", request.bucket_id);
                 state.buckets_pending = true;
@@ -445,8 +470,9 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
             Delivery::Sent | Delivery::Drop => {
                 if delivery == Delivery::Drop {
                     log::error!(
-                        "Heartbeat to {} failed, not retrying; event: {:?}",
+                        "Heartbeat to {} failed, not retrying: {}; event: {:?}",
                         request.bucket_id,
+                        failure.as_deref().unwrap_or("unknown error"),
                         request.event
                     );
                 }
@@ -481,6 +507,18 @@ fn create_private(path: &Path) -> io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
+}
+
+/// Make renames and removals in `path`'s directory durable, so they reach disk in the
+/// order they were made. Directories can't be synced on Windows; there it's a no-op.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -565,7 +603,11 @@ impl QueueFile {
             Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
             _ => {}
         }
+        sync_dir(path)?;
         fs::rename(&tmp_path, path)?;
+        // Before anything is appended, so an acknowledged heartbeat can't be written to
+        // a file that a crash then rolls back to the old one.
+        sync_dir(path)?;
 
         let file = OpenOptions::new().append(true).open(path)?;
         Ok((
@@ -605,6 +647,7 @@ impl QueueFile {
                 Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
                 _ => {}
             }
+            sync_dir(&self.path)?;
             self.delivered = 0;
             return self.file.set_len(0);
         }

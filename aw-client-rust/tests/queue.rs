@@ -408,3 +408,36 @@ fn queue_file_is_private() {
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
 }
+
+#[test]
+fn a_bucket_the_server_refuses_does_not_block_other_heartbeats() {
+    let port = closed_port();
+    let path = queue_path("refused");
+    let client = AwClient::new("127.0.0.1", port, &unique("refused")).unwrap();
+    let queue = client.request_queue_at(path.clone()).unwrap();
+    queue.register_bucket("refused", "currentwindow");
+    queue.register_bucket("ok", "currentwindow");
+    queue.heartbeat("refused", &event(0, "one"), 5.0).unwrap();
+    queue.heartbeat("ok", &event(0, "two"), 5.0).unwrap();
+    queue.stop();
+
+    let server = MockServer::start_on(TcpListener::bind(("127.0.0.1", port)).unwrap(), |line| {
+        if line.contains("/buckets/refused") {
+            if line.contains("/heartbeat") {
+                404
+            } else {
+                400
+            }
+        } else {
+            200
+        }
+    });
+    let queue = client.request_queue_at(path).unwrap();
+    wait_until("the queue to drain", || queue.is_empty());
+    queue.stop();
+    let lines = server.request_lines();
+    assert!(
+        lines.contains(&"POST /api/0/buckets/ok/heartbeat?pulsetime=5 HTTP/1.1".to_string()),
+        "{lines:?}"
+    );
+}
