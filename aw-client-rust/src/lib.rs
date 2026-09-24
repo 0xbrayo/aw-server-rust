@@ -198,6 +198,23 @@ impl AwClient {
         Self::send_success(self.client.get(url)).await?.json().await
     }
 
+    /// Fetch a single event by id. Returns `Ok(None)` when the server responds 404.
+    pub async fn get_event(
+        &self,
+        bucketname: &str,
+        event_id: i64,
+    ) -> Result<Option<Event>, reqwest::Error> {
+        let url = format!(
+            "{}api/0/buckets/{}/events/{}",
+            self.baseurl, bucketname, event_id
+        );
+        let response = self.client.get(url).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.json().await?))
+    }
+
     pub async fn insert_event(
         &self,
         bucketname: &str,

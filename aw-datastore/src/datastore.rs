@@ -993,6 +993,9 @@ impl DatastoreInstance {
             parse_event_row(row, None)
         }) {
             Ok(rows) => rows,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(DatastoreError::NoSuchEvent(bucket_id.to_string(), event_id))
+            }
             Err(err) => {
                 return Err(DatastoreError::InternalError(format!(
                     "Failed to map get_event SQL statement: {err}"
