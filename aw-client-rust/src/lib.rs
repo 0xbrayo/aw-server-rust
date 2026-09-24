@@ -111,7 +111,11 @@ impl AwClient {
                 "no data directory for the request queue",
             )
         })?;
-        self.request_queue_at(path)
+        let queue = self.request_queue_at(path)?;
+        if testing {
+            queue.set_commit_interval(queue::DEFAULT_COMMIT_INTERVAL_TESTING);
+        }
+        Ok(queue)
     }
 
     /// Like [`request_queue`](Self::request_queue), with an explicit queue file.
