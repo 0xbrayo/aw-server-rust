@@ -31,7 +31,7 @@ const DEFAULT_HOSTNAME: &str = "127.0.0.1";
 pub struct ClientConfig {
     pub hostname: String,
     pub port: u16,
-    /// Seconds a pre-merged heartbeat may grow before it is sent.
+    /// Seconds a pre-merged heartbeat may grow before it is sent (finite, `>= 0`).
     pub commit_interval: f64,
 }
 
@@ -116,6 +116,12 @@ pub fn parse_config(raw: &str, testing: bool) -> Result<ClientConfig, String> {
                 toml::Value::Float(f) => *f,
                 _ => return Err(format!("[{client_key}] commit_interval must be a number")),
             };
+            // 0 is allowed: like in Python, it sends every merged heartbeat right away.
+            if !config.commit_interval.is_finite() || config.commit_interval < 0.0 {
+                return Err(format!(
+                    "[{client_key}] commit_interval must be a non-negative number of seconds"
+                ));
+            }
         }
     }
     Ok(config)
@@ -203,6 +209,15 @@ commit_interval = 5
         assert!(parse_config("[server]\nport = 70000\n", false).is_err());
         assert!(parse_config("server = 1\n", false).is_err());
         assert!(parse_config("[client]\ncommit_interval = \"soon\"\n", false).is_err());
+        assert!(parse_config("[client]\ncommit_interval = -1\n", false).is_err());
+        assert!(parse_config("[client]\ncommit_interval = nan\n", false).is_err());
+        assert!(parse_config("[client]\ncommit_interval = inf\n", false).is_err());
+        assert_eq!(
+            parse_config("[client]\ncommit_interval = 0\n", false)
+                .unwrap()
+                .commit_interval,
+            0.0
+        );
         assert!(parse_config("not toml", false).is_err());
     }
 
