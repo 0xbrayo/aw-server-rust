@@ -165,6 +165,17 @@ impl Shared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Sleep for `timeout`, waking early only to stop; returns whether the queue should
+    /// stop. For backing off after a failed request, which new work shouldn't cut short.
+    fn back_off(&self, timeout: Duration) -> bool {
+        let state = self.lock();
+        let (state, _) = self
+            .wake
+            .wait_timeout_while(state, timeout, |state| !state.stop)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stop
+    }
+
     /// Wake the worker, even if it isn't waiting yet.
     fn notify(&self, mut state: MutexGuard<'_, State>) {
         state.woken = true;
@@ -533,7 +544,7 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
                 shared.lock().connected = false;
             }
             Delivery::Retry | Delivery::MissingBucket => {
-                if shared.wait(RETRY_DELAY) {
+                if shared.back_off(RETRY_DELAY) {
                     return;
                 }
             }
