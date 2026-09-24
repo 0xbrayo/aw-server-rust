@@ -441,3 +441,43 @@ fn a_bucket_the_server_refuses_does_not_block_other_heartbeats() {
         "{lines:?}"
     );
 }
+
+#[test]
+fn transient_errors_creating_a_bucket_are_retried() {
+    let (mut creates, mut created) = (0, false);
+    let server = MockServer::start(move |line| {
+        if line.contains("/heartbeat") {
+            // Like the server: no bucket, no heartbeat.
+            return if created { 200 } else { 404 };
+        }
+        creates += 1;
+        match creates {
+            1 => 429,
+            2 => 408,
+            _ => {
+                created = true;
+                200
+            }
+        }
+    });
+    let client = AwClient::new("127.0.0.1", server.port, &unique("create-retry")).unwrap();
+    let queue = client.request_queue_at(queue_path("create-retry")).unwrap();
+    queue.register_bucket("window", "currentwindow");
+    queue.heartbeat("window", &event(0, "one"), 5.0).unwrap();
+    // Registering again wakes the worker instead of waiting out the reconnect interval.
+    wait_until("the first attempt", || !server.request_lines().is_empty());
+    queue.register_bucket("window", "currentwindow");
+    wait_until("the second attempt", || server.request_lines().len() >= 2);
+    queue.register_bucket("window", "currentwindow");
+    wait_until("the queue to drain", || queue.is_empty());
+    queue.stop();
+
+    let lines = server.request_lines();
+    let creates = lines.iter().filter(|l| !l.contains("/heartbeat")).count();
+    assert!(creates >= 3, "bucket creation wasn't retried: {lines:?}");
+    assert_eq!(
+        lines.last().unwrap(),
+        "POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1",
+        "{lines:?}"
+    );
+}

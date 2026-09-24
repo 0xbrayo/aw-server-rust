@@ -101,17 +101,24 @@ impl Transport {
         Ok(())
     }
 
-    async fn heartbeat(&self, request: &QueuedHeartbeat) -> Result<(), reqwest::Error> {
+    /// Send one heartbeat. An error status comes back with the response body, which
+    /// usually says why the server rejected it.
+    async fn heartbeat(&self, request: &QueuedHeartbeat) -> Result<(), (reqwest::Error, String)> {
         let mut url = self.url(&["buckets", &request.bucket_id, "heartbeat"]);
         url.query_pairs_mut()
             .append_pair("pulsetime", &request.pulsetime.to_string());
-        self.client
+        let response = self
+            .client
             .post(url)
             .timeout(REQUEST_TIMEOUT)
             .json(&request.event)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(|err| (err, String::new()))?;
+        if let Err(err) = response.error_for_status_ref() {
+            let body = response.text().await.unwrap_or_default();
+            return Err((err, body));
+        }
         Ok(())
     }
 }
@@ -127,6 +134,9 @@ struct State {
     /// Buckets the server refused to create (a 4xx); their heartbeats are dropped rather
     /// than blocking the rest of the queue.
     rejected_buckets: Vec<String>,
+    /// Bumped by every `register_bucket`, so the worker can tell whether registrations
+    /// changed while it was creating buckets.
+    registrations: u64,
     connected: bool,
     stop: bool,
 }
@@ -227,6 +237,7 @@ impl RequestQueue {
                 buckets_pending: !buckets.is_empty(),
                 buckets,
                 rejected_buckets: Vec::new(),
+                registrations: 0,
                 connected: false,
                 stop: false,
             }),
@@ -252,6 +263,7 @@ impl RequestQueue {
         }
         // Registering again (e.g. after fixing the hostname) gives it another try.
         state.rejected_buckets.retain(|id| id != bucket_id);
+        state.registrations += 1;
         state.buckets_pending = true;
         drop(state);
         self.shared.wake.notify_all();
@@ -334,12 +346,21 @@ fn classify(err: &reqwest::Error) -> Delivery {
     }
     match err.status() {
         Some(reqwest::StatusCode::NOT_FOUND) => Delivery::MissingBucket,
-        Some(reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS) => {
-            Delivery::Retry
-        }
-        Some(status) if status.is_server_error() => Delivery::Retry,
+        Some(status) if is_transient(status) => Delivery::Retry,
         _ => Delivery::Drop,
     }
+}
+
+/// Statuses worth retrying: the server is overloaded, rate limiting, or failing.
+fn is_transient(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+/// A 4xx that won't change on retry.
+fn is_refusal(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && !is_transient(status)
 }
 
 fn run_worker(shared: Arc<Shared>, transport: Transport) {
@@ -355,7 +376,7 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
     };
 
     loop {
-        let (connected, buckets_pending, buckets) = {
+        let (connected, buckets_pending, buckets, registrations) = {
             let state = shared.lock();
             if state.stop {
                 return;
@@ -364,6 +385,7 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
                 state.connected,
                 state.buckets_pending,
                 state.buckets.clone(),
+                state.registrations,
             )
         };
 
@@ -378,7 +400,7 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
                         Ok(()) => {}
                         // The server refuses this bucket (e.g. an invalid hostname), so
                         // retrying won't help; don't let it hold up the other buckets.
-                        Err(err) if err.status().is_some_and(|s| s.is_client_error()) => {
+                        Err(err) if err.status().is_some_and(is_refusal) => {
                             log::error!("Server refused to create bucket {bucket_id}: {err}");
                             rejected.push(bucket_id.clone());
                         }
@@ -387,7 +409,10 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
                 }
                 Ok(())
             });
-            if !rejected.is_empty() {
+            // If buckets were (re-)registered meanwhile, this attempt is stale: don't mark
+            // anything rejected, and create the current set again.
+            let registrations_changed = shared.lock().registrations != registrations;
+            if !rejected.is_empty() && !registrations_changed {
                 let mut state = shared.lock();
                 state.buckets.retain(|(id, _)| !rejected.contains(id));
                 state.rejected_buckets.extend(rejected.iter().cloned());
@@ -400,7 +425,7 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
                     }
                     state.connected = true;
                     // A bucket registered while we were creating the others is still pending.
-                    state.buckets_pending = state.buckets.len() != buckets.len() - rejected.len();
+                    state.buckets_pending = state.registrations != registrations;
                 }
                 Err(err) => {
                     let queued = {
@@ -428,8 +453,12 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
         let mut failure = None;
         let delivery = match runtime.block_on(transport.heartbeat(&request)) {
             Ok(()) => Delivery::Sent,
-            Err(err) => {
-                failure = Some(err.to_string());
+            Err((err, body)) => {
+                failure = Some(if body.trim().is_empty() {
+                    err.to_string()
+                } else {
+                    format!("{err}: {}", body.trim())
+                });
                 let delivery = classify(&err);
                 match delivery {
                     Delivery::Disconnected => log::warn!(
