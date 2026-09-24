@@ -669,7 +669,6 @@ pub(crate) fn find_remotes_nonlocal_selection(
     Ok(paths_to_remote_selection(filtered))
 }
 
-/// Collapse `{…}/{device_id}/*.db` paths to the largest file per device_id.
 /// A unique suffix for test temp paths: process id, time, and a per-process counter.
 /// The clock alone isn't enough: macOS reports time in microseconds, so tests running in
 /// parallel could get the same name and delete each other's files.
@@ -688,6 +687,7 @@ pub(crate) fn unique_test_suffix() -> String {
     )
 }
 
+/// Collapse `{…}/{device_id}/*.db` paths to the largest file per device_id.
 #[cfg(test)]
 fn select_db_paths_by_device_id(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths_to_remote_selection(paths)
