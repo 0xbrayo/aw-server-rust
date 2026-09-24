@@ -201,6 +201,7 @@ dependencies = [
  "aw-models",
  "aw-server",
  "chrono",
+ "clap",
  "dirs",
  "fs4",
  "gethostname",

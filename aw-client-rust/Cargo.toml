@@ -18,6 +18,16 @@ libc = "0.2"
 thiserror = "1.0"
 dirs = "6.0"
 fs4 = { version = "0.13", features = ["sync"] }
+clap = { version = "4.1", features = ["derive", "env"], optional = true }
+
+[features]
+# The `aw-client` command-line tool (src/bin/aw-client.rs).
+cli = ["dep:clap"]
+
+[[bin]]
+name = "aw-client"
+path = "src/bin/aw-client.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 aw-datastore = { path = "../aw-datastore" }
