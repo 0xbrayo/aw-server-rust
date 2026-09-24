@@ -408,16 +408,11 @@ pub fn load_last_report_from(path: &Path) -> Result<Option<SyncReport>, Box<dyn 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_report_path() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "aw-sync-report-{}-{}.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-report-{}.json",
+            crate::util::unique_test_suffix(),
         ))
     }
 
@@ -500,12 +495,8 @@ mod tests {
     #[test]
     fn zero_peer_pass_reports_empty_peers_and_captures_discovery_warnings() {
         let root = std::env::temp_dir().join(format!(
-            "aw-sync-zero-peers-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-zero-peers-{}",
+            crate::util::unique_test_suffix(),
         ));
         fs::create_dir_all(&root).unwrap();
 
