@@ -319,12 +319,13 @@ async fn wait_for_server(
                 .await;
             match attempt {
                 Ok(response) => {
-                    // Decoding checks that it's an ActivityWatch server answering.
-                    response
-                        .error_for_status()?
-                        .json::<aw_models::Info>()
-                        .await?;
-                    return Ok(());
+                    // A body cut short or stalled past the attempt timeout while the server
+                    // is starting fails `bytes()`; that falls through to a retry.
+                    if let Ok(body) = response.error_for_status()?.bytes().await {
+                        // Decoding checks that it's an ActivityWatch server answering.
+                        serde_json::from_slice::<aw_models::Info>(&body)?;
+                        return Ok(());
+                    }
                 }
                 // Refused, closed before responding (is_request), or unanswered: the server
                 // may still be starting, so retry.
@@ -458,7 +459,37 @@ mod tests {
         });
     }
 
-    async fn assert_fails_immediately(status_line: &str, body: &str) -> reqwest::Error {
+    #[test]
+    fn test_wait_for_start_retries_truncated_body() {
+        runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = info_url(listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                // Send the headers and half of the body, then hang up.
+                let (mut truncated, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 1024];
+                let _ = truncated.read(&mut buf).await.unwrap();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                    INFO_BODY.len()
+                );
+                truncated.write_all(head.as_bytes()).await.unwrap();
+                truncated
+                    .write_all(&INFO_BODY.as_bytes()[..INFO_BODY.len() / 2])
+                    .await
+                    .unwrap();
+                drop(truncated);
+                answer_once(&listener, "200 OK", INFO_BODY).await;
+            });
+            let client = reqwest::Client::new();
+            super::wait_for_server(&client, url, std::time::Duration::from_secs(3))
+                .await
+                .unwrap();
+            server.await.unwrap();
+        });
+    }
+
+    async fn assert_fails_immediately(status_line: &str, body: &str) -> Box<dyn std::error::Error> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = info_url(listener.local_addr().unwrap());
         let server = async { answer_once(&listener, status_line, body).await };
@@ -467,13 +498,14 @@ mod tests {
         let wait = super::wait_for_server(&client, url, std::time::Duration::from_secs(5));
         let (_, result) = tokio::join!(server, wait);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        *result.unwrap_err().downcast::<reqwest::Error>().unwrap()
+        result.unwrap_err()
     }
 
     #[test]
     fn test_wait_for_start_returns_http_errors_immediately() {
         runtime().block_on(async {
             let error = assert_fails_immediately("500 Internal Server Error", "{}").await;
+            let error = error.downcast_ref::<reqwest::Error>().unwrap();
             assert_eq!(
                 error.status(),
                 Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
@@ -485,7 +517,10 @@ mod tests {
     fn test_wait_for_start_rejects_other_services() {
         runtime().block_on(async {
             let error = assert_fails_immediately("200 OK", r#"{"status":"ok"}"#).await;
-            assert!(error.is_decode(), "expected a decode error, got {error:?}");
+            assert!(
+                error.downcast_ref::<serde_json::Error>().is_some(),
+                "expected a JSON decode error, got {error:?}"
+            );
         });
     }
 
