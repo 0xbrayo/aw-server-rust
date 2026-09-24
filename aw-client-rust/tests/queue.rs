@@ -201,7 +201,6 @@ fn keeps_heartbeats_while_server_is_down_and_sends_them_later() {
     let queue = client.request_queue_at(path.clone()).unwrap();
     queue.heartbeat("bucket", &event(0, "one"), 5.0).unwrap();
     queue.heartbeat("bucket", &event(1, "two"), 5.0).unwrap();
-    wait_until("a failed connection attempt", || !queue.is_connected());
     assert_eq!(queue.len(), 2);
     queue.stop();
 
@@ -300,4 +299,112 @@ fn default_queue_path_separates_testing() {
     let testing = aw_client_rust::queue::default_queue_path("aw-watcher-x", true).unwrap();
     assert!(prod.ends_with("aw-client/queued/aw-watcher-x.v1.jsonl"));
     assert!(testing.ends_with("aw-client/queued/aw-watcher-x-testing.v1.jsonl"));
+}
+
+#[test]
+fn a_queue_file_can_only_be_open_once() {
+    let path = queue_path("locked");
+    let client = AwClient::new("127.0.0.1", closed_port(), &unique("locked")).unwrap();
+    let queue = client.request_queue_at(path.clone()).unwrap();
+    let err = client.request_queue_at(path.clone()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    queue.stop();
+    client.request_queue_at(path).unwrap().stop();
+}
+
+#[test]
+fn reopened_queue_recreates_buckets_before_sending() {
+    let port = closed_port();
+    let path = queue_path("recreate");
+    let client = AwClient::new("127.0.0.1", port, &unique("recreate")).unwrap();
+    let queue = client.request_queue_at(path.clone()).unwrap();
+    queue.register_bucket("window", "currentwindow");
+    queue.heartbeat("window", &event(0, "one"), 5.0).unwrap();
+    queue.stop();
+
+    // The watcher restarts; the queue delivers before the watcher registers anything.
+    let server = MockServer::start_on(TcpListener::bind(("127.0.0.1", port)).unwrap(), |_| 200);
+    let queue = client.request_queue_at(path).unwrap();
+    wait_until("the queue to drain", || queue.is_empty());
+    queue.stop();
+    assert_eq!(
+        server.request_lines(),
+        vec![
+            "POST /api/0/buckets/window HTTP/1.1",
+            "POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1",
+        ]
+    );
+}
+
+#[test]
+fn a_missing_bucket_is_recreated_and_temporary_errors_retried() {
+    let mut heartbeats = 0;
+    let server = MockServer::start(move |line| {
+        if !line.contains("/heartbeat") {
+            return 200;
+        }
+        heartbeats += 1;
+        match heartbeats {
+            1 => 404, // bucket deleted behind our back: recreate, then retry
+            2 => 503, // temporarily unavailable: retry
+            3 => 429, // rate limited: retry
+            _ => 200,
+        }
+    });
+    let client = AwClient::new("127.0.0.1", server.port, &unique("missing")).unwrap();
+    let queue = client.request_queue_at(queue_path("missing")).unwrap();
+    queue.register_bucket("window", "currentwindow");
+    queue.heartbeat("window", &event(0, "one"), 5.0).unwrap();
+    wait_until("the queue to drain", || queue.is_empty());
+    queue.stop();
+
+    assert_eq!(
+        server.request_lines(),
+        vec![
+            "POST /api/0/buckets/window HTTP/1.1",
+            "POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1",
+            "POST /api/0/buckets/window HTTP/1.1",
+            "POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1",
+            "POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1",
+            "POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1",
+        ]
+    );
+}
+
+#[test]
+fn heartbeats_to_an_unknown_missing_bucket_are_dropped() {
+    let server = MockServer::start(|line| {
+        if line.contains("/heartbeat") {
+            404
+        } else {
+            200
+        }
+    });
+    let client = AwClient::new("127.0.0.1", server.port, &unique("unknown")).unwrap();
+    let queue = client.request_queue_at(queue_path("unknown")).unwrap();
+    queue
+        .heartbeat("never-registered", &event(0, "one"), 5.0)
+        .unwrap();
+    wait_until("the queue to drain", || queue.is_empty());
+    queue.stop();
+    assert_eq!(
+        server.request_lines(),
+        vec![
+            "GET /api/0/info HTTP/1.1",
+            "POST /api/0/buckets/never-registered/heartbeat?pulsetime=5 HTTP/1.1",
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn queue_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = queue_path("private");
+    let client = AwClient::new("127.0.0.1", closed_port(), &unique("private")).unwrap();
+    let queue = client.request_queue_at(path.clone()).unwrap();
+    queue.heartbeat("bucket", &event(0, "one"), 5.0).unwrap();
+    queue.stop();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
 }

@@ -4,16 +4,20 @@
 //! background thread, so a watcher keeps recording while the server is down or
 //! restarting, and nothing queued is lost if the watcher itself exits. Buckets
 //! registered with [`RequestQueue::register_bucket`] are created every time the
-//! queue (re)connects, before any queued heartbeat is sent.
+//! queue (re)connects, before any queued heartbeat is sent. Each queued heartbeat
+//! remembers its bucket's type, so a queue reopened on the same file can recreate the
+//! buckets it has heartbeats for, and a bucket that disappears (a 404) is recreated
+//! rather than its heartbeats dropped.
 //!
-//! Delivery follows the Python client: connection failures and 500s are retried,
-//! a 400 (a payload that will never be accepted) is dropped, and any other error
-//! is logged and dropped.
+//! Delivery follows the Python client, retrying a little more: connection failures,
+//! timeouts, 408, 429 and 5xx responses are retried; a 400 (a payload that will never be
+//! accepted) and any other error are logged and the heartbeat is dropped.
 //!
-//! The queue file is append-only JSON lines, with a sibling `.offset` file that counts
-//! the lines already delivered. Delivering a heartbeat costs one small write, and a
-//! crash re-sends at most the one heartbeat that was in flight. The file is truncated
-//! whenever the queue drains.
+//! The queue file is append-only JSON lines, readable only by the owner on Unix, with a
+//! sibling `.offset` file that counts the lines already delivered. Each append is synced
+//! to disk before [`RequestQueue::heartbeat`] returns; delivering a heartbeat costs one
+//! small write. A crash can make the queue re-send heartbeats, but never skip one. A
+//! `.lock` file keeps two queues from using the same file at once.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -23,6 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map};
 
@@ -41,6 +46,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QueuedHeartbeat {
     bucket_id: String,
+    /// The bucket's event type if it was registered, so the bucket can be recreated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bucket_type: Option<String>,
     pulsetime: f64,
     event: Event,
 }
@@ -113,10 +121,20 @@ struct State {
     log: QueueFile,
     /// (bucket_id, event_type) to create on every (re)connect.
     buckets: Vec<(String, String)>,
-    /// Set when a bucket is registered, so it's created before the next delivery.
+    /// Set when a bucket is registered or goes missing, so it's created before the next
+    /// delivery.
     buckets_pending: bool,
     connected: bool,
     stop: bool,
+}
+
+impl State {
+    fn bucket_type(&self, bucket_id: &str) -> Option<String> {
+        self.buckets
+            .iter()
+            .find(|(id, _)| id == bucket_id)
+            .map(|(_, event_type)| event_type.clone())
+    }
 }
 
 struct Shared {
@@ -179,6 +197,7 @@ pub fn default_queue_path(client_name: &str, testing: bool) -> Option<PathBuf> {
 }
 
 impl RequestQueue {
+    /// Open the queue file, failing with `WouldBlock` if another queue has it open.
     pub(crate) fn start(transport: Transport, path: PathBuf) -> io::Result<RequestQueue> {
         let (log, queue) = QueueFile::open(&path)?;
         if !queue.is_empty() {
@@ -188,12 +207,22 @@ impl RequestQueue {
                 path.display()
             );
         }
+        // Recreate the buckets that queued heartbeats belong to before sending them.
+        let mut buckets: Vec<(String, String)> = Vec::new();
+        for request in &queue {
+            if let Some(bucket_type) = &request.bucket_type {
+                let entry = (request.bucket_id.clone(), bucket_type.clone());
+                if !buckets.contains(&entry) {
+                    buckets.push(entry);
+                }
+            }
+        }
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 queue,
                 log,
-                buckets: Vec::new(),
-                buckets_pending: false,
+                buckets_pending: !buckets.is_empty(),
+                buckets,
                 connected: false,
                 stop: false,
             }),
@@ -222,15 +251,16 @@ impl RequestQueue {
         self.shared.wake.notify_all();
     }
 
-    /// Queue a heartbeat. It's written to the queue file before this returns and
+    /// Queue a heartbeat. It's synced to the queue file before this returns and
     /// delivered in order by the background thread.
     pub fn heartbeat(&self, bucket_id: &str, event: &Event, pulsetime: f64) -> io::Result<()> {
+        let mut state = self.shared.lock();
         let request = QueuedHeartbeat {
             bucket_id: bucket_id.to_string(),
+            bucket_type: state.bucket_type(bucket_id),
             pulsetime,
             event: event.clone(),
         };
-        let mut state = self.shared.lock();
         state.log.append(&request)?;
         state.queue.push_back(request);
         drop(state);
@@ -279,12 +309,15 @@ impl Drop for RequestQueue {
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum Delivery {
     Sent,
     /// Server unreachable: mark disconnected and reconnect first.
     Disconnected,
     /// Transient server error: try the same heartbeat again shortly.
     Retry,
+    /// The bucket doesn't exist (404): create it if we know its type.
+    MissingBucket,
     /// Will never succeed: drop it.
     Drop,
 }
@@ -294,8 +327,11 @@ fn classify(err: &reqwest::Error) -> Delivery {
         return Delivery::Disconnected;
     }
     match err.status() {
-        Some(reqwest::StatusCode::BAD_REQUEST) => Delivery::Drop,
-        Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR) => Delivery::Retry,
+        Some(reqwest::StatusCode::NOT_FOUND) => Delivery::MissingBucket,
+        Some(reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS) => {
+            Delivery::Retry
+        }
+        Some(status) if status.is_server_error() => Delivery::Retry,
         _ => Delivery::Drop,
     }
 }
@@ -376,22 +412,44 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
                     Delivery::Disconnected => log::warn!(
                         "Connection refused or timeout, will queue requests until connection is available: {err}"
                     ),
-                    Delivery::Retry => {
-                        log::error!("Server error, retrying heartbeat to {}: {err}", request.bucket_id)
-                    }
-                    Delivery::Drop => log::error!(
-                        "Heartbeat to {} failed, not retrying: {err}; event: {:?}",
-                        request.bucket_id,
-                        request.event
+                    Delivery::Retry => log::error!(
+                        "Server error, retrying heartbeat to {}: {err}",
+                        request.bucket_id
                     ),
-                    Delivery::Sent => {}
+                    Delivery::MissingBucket | Delivery::Drop | Delivery::Sent => {}
                 }
                 delivery
             }
         };
 
+        let delivery = if delivery == Delivery::MissingBucket {
+            let mut state = shared.lock();
+            if state.bucket_type(&request.bucket_id).is_some() {
+                // Recreate it (and any other registered bucket) before retrying.
+                log::warn!("Bucket {} is missing, recreating it", request.bucket_id);
+                state.buckets_pending = true;
+                Delivery::Retry
+            } else if let Some(bucket_type) = request.bucket_type.clone() {
+                log::warn!("Bucket {} is missing, recreating it", request.bucket_id);
+                state.buckets.push((request.bucket_id.clone(), bucket_type));
+                state.buckets_pending = true;
+                Delivery::Retry
+            } else {
+                Delivery::Drop
+            }
+        } else {
+            delivery
+        };
+
         match delivery {
             Delivery::Sent | Delivery::Drop => {
+                if delivery == Delivery::Drop {
+                    log::error!(
+                        "Heartbeat to {} failed, not retrying; event: {:?}",
+                        request.bucket_id,
+                        request.event
+                    );
+                }
                 let mut state = shared.lock();
                 state.queue.pop_front();
                 let remaining = state.queue.len();
@@ -403,7 +461,7 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
                 // The reconnect step at the top of the loop waits between attempts.
                 shared.lock().connected = false;
             }
-            Delivery::Retry => {
+            Delivery::Retry | Delivery::MissingBucket => {
                 if shared.wait(RETRY_DELAY) {
                     return;
                 }
@@ -412,12 +470,33 @@ fn run_worker(shared: Arc<Shared>, transport: Transport) {
     }
 }
 
+/// Create (or truncate) a file readable and writable only by its owner on Unix, since
+/// queued heartbeats contain activity data.
+fn create_private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
 /// Append-only JSON-lines queue file plus a `.offset` file counting delivered lines.
 struct QueueFile {
     path: PathBuf,
     offset_path: PathBuf,
     file: File,
     delivered: u64,
+    /// Held for the queue's lifetime so no other queue opens the same file.
+    _lock: File,
 }
 
 impl QueueFile {
@@ -425,9 +504,18 @@ impl QueueFile {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut offset_name = path.file_name().unwrap_or_default().to_os_string();
-        offset_name.push(".offset");
-        let offset_path = path.with_file_name(offset_name);
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(sibling(path, ".lock"))?;
+        if !lock.try_lock_exclusive()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("queue file {} is already in use", path.display()),
+            ));
+        }
+        let offset_path = sibling(path, ".offset");
 
         let delivered: u64 = match fs::read_to_string(&offset_path) {
             Ok(raw) => raw.trim().parse().unwrap_or(0),
@@ -461,11 +549,9 @@ impl QueueFile {
         // Rewrite the file with just the pending heartbeats: this drops delivered and
         // unreadable lines (a crash mid-write leaves a partial last line, which the
         // next append would otherwise run into) and resets the offset.
-        let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp_path = path.with_file_name(tmp_name);
+        let tmp_path = sibling(path, ".tmp");
         {
-            let mut tmp = File::create(&tmp_path)?;
+            let mut tmp = create_private(&tmp_path)?;
             for request in &queue {
                 let mut line = serde_json::to_vec(request)?;
                 line.push(b'\n');
@@ -473,11 +559,13 @@ impl QueueFile {
             }
             tmp.sync_all()?;
         }
-        fs::rename(&tmp_path, path)?;
+        // Remove the old offset before the rewritten file replaces the old one: a crash
+        // in between then re-sends delivered heartbeats instead of skipping pending ones.
         match fs::remove_file(&offset_path) {
             Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
             _ => {}
         }
+        fs::rename(&tmp_path, path)?;
 
         let file = OpenOptions::new().append(true).open(path)?;
         Ok((
@@ -486,6 +574,7 @@ impl QueueFile {
                 offset_path,
                 file,
                 delivered: 0,
+                _lock: lock,
             },
             queue,
         ))
@@ -494,19 +583,30 @@ impl QueueFile {
     fn append(&mut self, request: &QueuedHeartbeat) -> io::Result<()> {
         let mut line = serde_json::to_vec(request)?;
         line.push(b'\n');
-        self.file.write_all(&line)?;
-        self.file.flush()
+        let len = self.file.metadata()?.len();
+        let written = self
+            .file
+            .write_all(&line)
+            .and_then(|()| self.file.sync_data());
+        if let Err(err) = written {
+            // Don't leave part of a line for the next append to run into.
+            let _ = self.file.set_len(len);
+            return Err(err);
+        }
+        Ok(())
     }
 
-    /// Record one more delivered line; once nothing is left, truncate both files.
+    /// Record one more delivered line; once nothing is left, empty both files.
     fn mark_delivered(&mut self, remaining: usize) -> io::Result<()> {
         if remaining == 0 {
-            self.file.set_len(0)?;
+            // Offset first: a crash in between re-sends heartbeats rather than leaving a
+            // stale offset that would skip the next ones appended.
+            match fs::remove_file(&self.offset_path) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+                _ => {}
+            }
             self.delivered = 0;
-            return match fs::remove_file(&self.offset_path) {
-                Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
-                _ => Ok(()),
-            };
+            return self.file.set_len(0);
         }
         self.delivered += 1;
         fs::write(&self.offset_path, self.delivered.to_string())
