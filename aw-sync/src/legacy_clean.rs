@@ -26,13 +26,15 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use crate::sync::is_synced_bucket_id;
 use crate::util::{format_bytes, inspect_sync_db, scan_sync_dir, SyncEntryKind};
 
-/// One own staging database and the re-exported buckets it still holds.
+/// One own staging database and what cleanup would do to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PruneTarget {
     pub db_path: PathBuf,
     pub db_size: u64,
     /// `(bucket id, event count)`, in the order sqlite returned them.
     pub buckets: Vec<(String, i64)>,
+    /// Bytes on sqlite's freelist that `VACUUM` would give back.
+    pub reclaimable: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,10 +45,22 @@ pub struct PruneOutcome {
     pub size_after: u64,
 }
 
-/// Own staging databases that still contain `-synced-from-` buckets.
+/// A db whose freelist is at least 1/`RECLAIM_RATIO` of the file is worth a
+/// `VACUUM` even with nothing left to delete. Append-only staging almost never
+/// gets there on its own; a prune whose `VACUUM` failed (e.g. a daemon pass
+/// held the lock) does, so the next run retries it.
+const RECLAIM_RATIO: u64 = 10;
+
+fn needs_vacuum(reclaimable: u64, db_size: u64) -> bool {
+    reclaimable > 0 && reclaimable.saturating_mul(RECLAIM_RATIO) >= db_size
+}
+
+/// Own staging databases that hold `-synced-from-` buckets or are left
+/// oversized by an earlier prune.
 ///
-/// Returns the targets plus one message per own staging database that could
-/// not be inspected; those are reported and left alone.
+/// Returns the targets plus one message per own staging database that was
+/// skipped (could not be inspected, or resolves through a symlink); those are
+/// left alone and make the cleanup incomplete.
 pub fn find_prune_targets(
     sync_dir: &Path,
     local_device_id: &str,
@@ -60,19 +74,27 @@ pub fn find_prune_targets(
         let Some(db_path) = entry.db_path else {
             continue;
         };
-        match inspect_sync_db(&db_path) {
-            Ok(info) => {
+        if let Err(e) = ensure_no_symlink(sync_dir, &db_path) {
+            errors.push(e);
+            continue;
+        }
+        let inspected = inspect_sync_db(&db_path)
+            .and_then(|info| reclaimable_bytes(&db_path).map(|r| (info, r)));
+        match inspected {
+            Ok((info, reclaimable)) => {
                 let buckets: Vec<(String, i64)> = info
                     .buckets
                     .into_iter()
                     .filter(|b| is_synced_bucket_id(&b.id))
                     .map(|b| (b.id, b.event_count))
                     .collect();
-                if !buckets.is_empty() {
+                let db_size = entry.db_size.unwrap_or(0);
+                if !buckets.is_empty() || needs_vacuum(reclaimable, db_size) {
                     targets.push(PruneTarget {
                         db_path,
-                        db_size: entry.db_size.unwrap_or(0),
+                        db_size,
                         buckets,
+                        reclaimable,
                     });
                 }
             }
@@ -82,16 +104,61 @@ pub fn find_prune_targets(
     Ok((targets, errors))
 }
 
+/// Refuse a path that leaves `sync_dir` through a symlink.
+///
+/// Own vs peer is decided from the path's `device_id` component, but sqlite
+/// opens whatever the path resolves to. A symlinked `{own_id}/test.db` that
+/// points at a peer's file would otherwise get that peer's data deleted.
+fn ensure_no_symlink(sync_dir: &Path, db_path: &Path) -> Result<(), String> {
+    let rel = db_path.strip_prefix(sync_dir).map_err(|_| {
+        format!(
+            "{} is outside the sync dir {}",
+            db_path.display(),
+            sync_dir.display()
+        )
+    })?;
+    let canon = |p: &Path| fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()));
+    let expected = canon(sync_dir)?.join(rel);
+    let real = canon(db_path)?;
+    if real != expected {
+        return Err(format!(
+            "{} resolves to {} through a symlink; refusing to modify it",
+            db_path.display(),
+            real.display()
+        ));
+    }
+    Ok(())
+}
+
+fn reclaimable_bytes(db_path: &Path) -> Result<u64, String> {
+    let err = |e: rusqlite::Error| format!("{}: {e}", db_path.display());
+    let conn =
+        Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+    let free: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .map_err(err)?;
+    let page: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .map_err(err)?;
+    Ok((free.max(0) as u64).saturating_mul(page.max(0) as u64))
+}
+
 /// Delete `bucket_ids` and their events from an own staging database, then
 /// `VACUUM` so the file peers replicate actually shrinks.
 ///
 /// Refuses any id without the `-synced-from-` marker, so a caller bug cannot
-/// delete first-hand data. Ids that are already gone are skipped, which makes
-/// a re-run after an interrupted prune a no-op.
-pub fn prune_synced_buckets(db_path: &Path, bucket_ids: &[String]) -> Result<PruneOutcome, String> {
+/// delete first-hand data, and any path that resolves through a symlink.
+/// Ids that are already gone are skipped, and `VACUUM` runs whenever the
+/// freelist is non-empty, so a re-run after an interrupted prune finishes it.
+pub fn prune_synced_buckets(
+    sync_dir: &Path,
+    db_path: &Path,
+    bucket_ids: &[String],
+) -> Result<PruneOutcome, String> {
     if let Some(id) = bucket_ids.iter().find(|id| !is_synced_bucket_id(id)) {
         return Err(format!("refusing to prune first-hand bucket '{id}'"));
     }
+    ensure_no_symlink(sync_dir, db_path)?;
     let size_before = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
     let open_err = |e: rusqlite::Error| format!("{}: {e}", db_path.display());
 
@@ -127,11 +194,14 @@ pub fn prune_synced_buckets(db_path: &Path, bucket_ids: &[String]) -> Result<Pru
     }
     tx.commit().map_err(open_err)?;
 
-    if outcome.buckets > 0 {
+    let free_pages: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .map_err(open_err)?;
+    if free_pages > 0 {
         conn.execute_batch("VACUUM").map_err(|e| {
             format!(
-                "{}: buckets deleted but VACUUM failed ({e}); the file will not shrink until \
-                 it runs — stop aw-sync and re-run",
+                "{}: VACUUM failed ({e}); deleted buckets stay deleted but the file will not \
+                 shrink until it runs — re-run --clean-legacy (stop aw-sync first if it is busy)",
                 db_path.display()
             )
         })?;
@@ -166,16 +236,30 @@ fn clean_legacy(
 ) -> Result<(), Box<dyn Error>> {
     writeln!(out)?;
     writeln!(out, "Legacy cleanup (ActivityWatch/aw-server-rust#689)")?;
-    let (targets, errors) = find_prune_targets(sync_dir, device_id)?;
-    for e in &errors {
-        writeln!(out, "  ! skipped, could not inspect: {e}")?;
+    let (targets, skipped) = find_prune_targets(sync_dir, device_id)?;
+    for e in &skipped {
+        writeln!(out, "  ! skipped: {e}")?;
     }
+    // A skipped own db may still hold re-exported buckets, so the run is
+    // incomplete however the rest goes.
+    let incomplete = || -> Box<dyn Error> {
+        format!(
+            "cleanup incomplete: {} own staging db(s) skipped",
+            skipped.len()
+        )
+        .into()
+    };
+
     if targets.is_empty() {
         writeln!(
             out,
-            "  own staging dbs hold no re-exported …-synced-from-… buckets; nothing to do"
+            "  no other own staging db holds re-exported …-synced-from-… buckets"
         )?;
-        return Ok(());
+        return if skipped.is_empty() {
+            Ok(())
+        } else {
+            Err(incomplete())
+        };
     }
 
     let mut total_buckets = 0;
@@ -190,6 +274,14 @@ fn clean_legacy(
         for (id, events) in &t.buckets {
             writeln!(out, "    {id}  {events} events")?;
             total_events += events;
+        }
+        if t.buckets.is_empty() {
+            writeln!(
+                out,
+                "    no re-exported buckets left, but {} is reclaimable by VACUUM (an earlier \
+                 run did not finish)",
+                format_bytes(t.reclaimable)
+            )?;
         }
         total_buckets += t.buckets.len();
     }
@@ -206,13 +298,17 @@ fn clean_legacy(
              deletion replicates to every device sharing this folder; those devices already \
              ignore these buckets on pull."
         )?;
-        return Ok(());
+        return if skipped.is_empty() {
+            Ok(())
+        } else {
+            Err(incomplete())
+        };
     }
 
     let mut failed = 0;
     for t in &targets {
         let ids: Vec<String> = t.buckets.iter().map(|(id, _)| id.clone()).collect();
-        match prune_synced_buckets(&t.db_path, &ids) {
+        match prune_synced_buckets(sync_dir, &t.db_path, &ids) {
             Ok(o) => writeln!(
                 out,
                 "  pruned {} buckets ({} events) from {}: {} → {}",
@@ -229,7 +325,13 @@ fn clean_legacy(
         }
     }
     if failed > 0 {
-        Err(format!("{failed} staging db(s) could not be pruned"))?;
+        Err(format!(
+            "{failed} staging db(s) could not be pruned, {} skipped",
+            skipped.len()
+        ))?;
+    }
+    if !skipped.is_empty() {
+        return Err(incomplete());
     }
     Ok(())
 }
@@ -240,15 +342,20 @@ mod tests {
     use crate::sync::create_datastore;
     use aw_models::{Bucket, Event};
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const LOCAL: &str = "d7bc68e7-aaaa-bbbb-cccc-dddddddddddd";
     const PEER: &str = "41662faa-aaaa-bbbb-cccc-dddddddddddd";
 
     fn temp_sync_dir() -> PathBuf {
+        // Tests run in parallel; the counter keeps two same-nanosecond calls
+        // from sharing (and clobbering) one directory.
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "aw-sync-clean-{}-{}",
+            "aw-sync-clean-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -371,7 +478,7 @@ mod tests {
         let own = root.join(LOCAL).join("test.db");
         staging_db(&own, &[OWN], 1);
 
-        let err = prune_synced_buckets(&own, &[OWN.to_string()]).unwrap_err();
+        let err = prune_synced_buckets(&root, &own, &[OWN.to_string()]).unwrap_err();
         assert!(err.contains("first-hand"), "{err}");
         assert_eq!(bucket_ids(&own), vec![OWN.to_string()]);
         let _ = fs::remove_dir_all(&root);
@@ -383,12 +490,82 @@ mod tests {
         let own = root.join(LOCAL).join("test.db");
         staging_db(&own, &[OWN], 1);
 
-        let o = prune_synced_buckets(&own, &[REEXPORT.to_string()]).unwrap();
+        let o = prune_synced_buckets(&root, &own, &[REEXPORT.to_string()]).unwrap();
         assert_eq!((o.buckets, o.events), (0, 0));
 
         let gone = root.join("nope").join("test.db");
-        assert!(prune_synced_buckets(&gone, &[REEXPORT.to_string()]).is_err());
+        assert!(prune_synced_buckets(&root, &gone, &[REEXPORT.to_string()]).is_err());
         assert!(!gone.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn interrupted_vacuum_is_retried_on_next_run() {
+        let root = temp_sync_dir();
+        let own = root.join(LOCAL).join("test.db");
+        staging_db(&own, &[OWN, REEXPORT], 2000);
+        // Simulate a prune whose deletes committed but whose VACUUM failed.
+        {
+            let conn = Connection::open(&own).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM events WHERE bucketrow = (SELECT id FROM buckets WHERE name = '{REEXPORT}');
+                 DELETE FROM buckets WHERE name = '{REEXPORT}';"
+            ))
+            .unwrap();
+        }
+        assert!(reclaimable_bytes(&own).unwrap() > 0);
+
+        let (targets, _) = find_prune_targets(&root, LOCAL).unwrap();
+        assert_eq!(targets.len(), 1, "oversized db must stay a target");
+        assert!(targets[0].buckets.is_empty());
+
+        let mut out = Vec::new();
+        clean_legacy(&root, LOCAL, false, &mut out).unwrap();
+        assert_eq!(reclaimable_bytes(&own).unwrap(), 0);
+        let (targets, _) = find_prune_targets(&root, LOCAL).unwrap();
+        assert!(targets.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn own_path_symlinked_to_peer_db_is_refused() {
+        let root = temp_sync_dir();
+        let peer = root.join("erb-main3").join(PEER).join("test.db");
+        staging_db(&peer, &[REEXPORT], 3);
+        let own = root.join(LOCAL).join("test.db");
+        fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&peer, &own).unwrap();
+        let before = fs::read(&peer).unwrap();
+
+        let (targets, skipped) = find_prune_targets(&root, LOCAL).unwrap();
+        assert!(targets.is_empty(), "{targets:?}");
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].contains("symlink"), "{skipped:?}");
+
+        let mut out = Vec::new();
+        assert!(clean_legacy(&root, LOCAL, false, &mut out).is_err());
+        assert!(prune_synced_buckets(&root, &own, &[REEXPORT.to_string()]).is_err());
+        assert_eq!(
+            fs::read(&peer).unwrap(),
+            before,
+            "peer db must be untouched"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn uninspectable_own_db_makes_cleanup_fail() {
+        let root = temp_sync_dir();
+        let own = root.join(LOCAL).join("test.db");
+        fs::create_dir_all(own.parent().unwrap()).unwrap();
+        fs::write(&own, b"not a sqlite database").unwrap();
+
+        let mut out = Vec::new();
+        let err = clean_legacy(&root, LOCAL, true, &mut out).unwrap_err();
+        assert!(err.to_string().contains("incomplete"), "{err}");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("skipped"), "{out}");
         let _ = fs::remove_dir_all(&root);
     }
 }
