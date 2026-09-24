@@ -139,6 +139,9 @@ struct State {
     registrations: u64,
     connected: bool,
     stop: bool,
+    /// Set by [`Shared::notify`] and consumed by [`Shared::wait`], so a wake-up sent
+    /// while the worker is busy (not yet waiting) isn't lost.
+    woken: bool,
 }
 
 impl State {
@@ -162,16 +165,25 @@ impl Shared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Sleep for `timeout` or until woken; returns whether the queue should stop.
+    /// Wake the worker, even if it isn't waiting yet.
+    fn notify(&self, mut state: MutexGuard<'_, State>) {
+        state.woken = true;
+        drop(state);
+        self.wake.notify_all();
+    }
+
+    /// Sleep for `timeout` or until woken (including by a [`notify`](Self::notify) since
+    /// the last wait); returns whether the queue should stop.
     fn wait(&self, timeout: Duration) -> bool {
-        let state = self.lock();
-        if state.stop {
-            return true;
+        let mut state = self.lock();
+        if !state.stop && !state.woken {
+            state = self
+                .wake
+                .wait_timeout_while(state, timeout, |state| !state.stop && !state.woken)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
-        let (state, _) = self
-            .wake
-            .wait_timeout(state, timeout)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.woken = false;
         state.stop
     }
 }
@@ -240,6 +252,7 @@ impl RequestQueue {
                 registrations: 0,
                 connected: false,
                 stop: false,
+                woken: false,
             }),
             wake: Condvar::new(),
         });
@@ -265,8 +278,7 @@ impl RequestQueue {
         state.rejected_buckets.retain(|id| id != bucket_id);
         state.registrations += 1;
         state.buckets_pending = true;
-        drop(state);
-        self.shared.wake.notify_all();
+        self.shared.notify(state);
     }
 
     /// Queue a heartbeat. It's synced to the queue file before this returns and
@@ -281,8 +293,11 @@ impl RequestQueue {
         };
         state.log.append(&request)?;
         state.queue.push_back(request);
-        drop(state);
-        self.shared.wake.notify_all();
+        // While disconnected the worker is waiting out the reconnect interval; waking it
+        // for every heartbeat would turn that into a reconnect attempt per heartbeat.
+        if state.connected {
+            self.shared.notify(state);
+        }
         Ok(())
     }
 
@@ -311,8 +326,9 @@ impl RequestQueue {
     }
 
     fn shutdown(&mut self) {
-        self.shared.lock().stop = true;
-        self.shared.wake.notify_all();
+        let mut state = self.shared.lock();
+        state.stop = true;
+        self.shared.notify(state);
         if let Some(worker) = self.worker.take() {
             if worker.join().is_err() {
                 log::error!("aw-client request queue worker panicked");

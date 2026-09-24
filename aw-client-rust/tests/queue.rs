@@ -446,6 +446,9 @@ fn a_bucket_the_server_refuses_does_not_block_other_heartbeats() {
 fn transient_errors_creating_a_bucket_are_retried() {
     let (mut creates, mut created) = (0, false);
     let server = MockServer::start(move |line| {
+        if line.contains("/api/0/info") {
+            return 200;
+        }
         if line.contains("/heartbeat") {
             // Like the server: no bucket, no heartbeat.
             return if created { 200 } else { 404 };
@@ -465,15 +468,26 @@ fn transient_errors_creating_a_bucket_are_retried() {
     queue.register_bucket("window", "currentwindow");
     queue.heartbeat("window", &event(0, "one"), 5.0).unwrap();
     // Registering again wakes the worker instead of waiting out the reconnect interval.
-    wait_until("the first attempt", || !server.request_lines().is_empty());
+    // A registration made while an attempt is in flight must not be lost.
+    let attempts = || {
+        server
+            .request_lines()
+            .iter()
+            .filter(|l| *l == "POST /api/0/buckets/window HTTP/1.1")
+            .count()
+    };
+    wait_until("the first attempt", || attempts() >= 1);
     queue.register_bucket("window", "currentwindow");
-    wait_until("the second attempt", || server.request_lines().len() >= 2);
+    wait_until("the second attempt", || attempts() >= 2);
     queue.register_bucket("window", "currentwindow");
     wait_until("the queue to drain", || queue.is_empty());
     queue.stop();
 
     let lines = server.request_lines();
-    let creates = lines.iter().filter(|l| !l.contains("/heartbeat")).count();
+    let creates = lines
+        .iter()
+        .filter(|l| *l == "POST /api/0/buckets/window HTTP/1.1")
+        .count();
     assert!(creates >= 3, "bucket creation wasn't retried: {lines:?}");
     assert_eq!(
         lines.last().unwrap(),
