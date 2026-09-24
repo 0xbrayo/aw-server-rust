@@ -8,6 +8,7 @@ extern crate tokio;
 pub mod blocking;
 pub mod classes;
 pub mod queries;
+pub mod queue;
 pub mod single_instance;
 
 use std::{collections::HashMap, error::Error};
@@ -98,6 +99,35 @@ impl AwClient {
             name: name.to_string(),
             hostname,
         })
+    }
+
+    /// Start an offline request queue (see [`queue`]) backed by the default queue file for
+    /// this client name, `testing` selecting a separate file, like `queued=True` in the
+    /// Python client.
+    pub fn request_queue(&self, testing: bool) -> std::io::Result<queue::RequestQueue> {
+        let path = queue::default_queue_path(&self.name, testing).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no data directory for the request queue",
+            )
+        })?;
+        self.request_queue_at(path)
+    }
+
+    /// Like [`request_queue`](Self::request_queue), with an explicit queue file.
+    pub fn request_queue_at(
+        &self,
+        path: std::path::PathBuf,
+    ) -> std::io::Result<queue::RequestQueue> {
+        queue::RequestQueue::start(
+            queue::Transport {
+                client: self.client.clone(),
+                baseurl: self.baseurl.clone(),
+                name: self.name.clone(),
+                hostname: self.hostname.clone(),
+            },
+            path,
+        )
     }
 
     pub async fn get_bucket(&self, bucketname: &str) -> Result<Bucket, reqwest::Error> {
