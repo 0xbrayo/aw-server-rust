@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -665,7 +665,10 @@ impl QueueFile {
         // a file that a crash then rolls back to the old one.
         sync_dir(path)?;
 
-        let file = OpenOptions::new().append(true).open(path)?;
+        // Plain write access rather than append mode: Windows doesn't allow truncating a
+        // file opened for appending, and the queue truncates when it drains. `append`
+        // seeks to the end before each write instead.
+        let file = OpenOptions::new().write(true).open(path)?;
         Ok((
             QueueFile {
                 path: path.to_path_buf(),
@@ -681,7 +684,7 @@ impl QueueFile {
     fn append(&mut self, request: &QueuedHeartbeat) -> io::Result<()> {
         let mut line = serde_json::to_vec(request)?;
         line.push(b'\n');
-        let len = self.file.metadata()?.len();
+        let len = self.file.seek(SeekFrom::End(0))?;
         let written = self
             .file
             .write_all(&line)
