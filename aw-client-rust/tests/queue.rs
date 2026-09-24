@@ -499,15 +499,19 @@ fn transient_errors_creating_a_bucket_are_retried() {
     wait_until("the queue to drain", || queue.is_empty());
     queue.stop();
 
+    // The heartbeat went through after the third (successful) creation attempt. A later
+    // registration may add another creation after it, which is fine.
     let lines = server.request_lines();
-    let creates = lines
+    let third_create = lines
         .iter()
-        .filter(|l| *l == "POST /api/0/buckets/window HTTP/1.1")
-        .count();
-    assert!(creates >= 3, "bucket creation wasn't retried: {lines:?}");
-    assert_eq!(
-        lines.last().unwrap(),
-        "POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1",
+        .enumerate()
+        .filter(|(_, l)| *l == "POST /api/0/buckets/window HTTP/1.1")
+        .nth(2)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("bucket creation wasn't retried: {lines:?}"));
+    assert!(
+        lines[third_create..]
+            .contains(&"POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1".to_string()),
         "{lines:?}"
     );
 }
