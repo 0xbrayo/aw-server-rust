@@ -66,9 +66,9 @@ enum Command {
         hostname: String,
         #[command(flatten)]
         range: Range,
-        /// Number of rows per table
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
+        /// Number of rows per table (at most 100, the number of titles the query returns)
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
     },
     /// Query 'canonical events' for a single host (filtered, classified)
     Canonical {
@@ -156,15 +156,15 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<(), Box<dyn Error>> {
                 duration: Duration::zero(),
                 data,
             };
-            writeln!(out, "{}", serde_json::to_string(&event)?)?;
             client.heartbeat(&bucket_id, &event, pulsetime)?;
+            writeln!(out, "{}", serde_json::to_string(&event)?)?;
         }
         Command::Buckets => {
             let mut ids: Vec<_> = client.get_buckets()?.into_keys().collect();
             ids.sort();
             writeln!(out, "Buckets:")?;
             for id in ids {
-                writeln!(out, " - {id}")?;
+                writeln!(out, " - {}", printable(&id))?;
             }
         }
         Command::Events { bucket_id } => {
@@ -188,7 +188,12 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<(), Box<dyn Error>> {
                 for period in result {
                     let events: Vec<Event> = serde_json::from_value(period)
                         .map_err(|err| format!("query didn't return a list of events: {err}"))?;
-                    writeln!(out, "Showing 10 out of {} events:", events.len())?;
+                    writeln!(
+                        out,
+                        "Showing {} out of {} events:",
+                        events.len().min(10),
+                        events.len()
+                    )?;
                     for event in events.iter().take(10) {
                         writeln!(
                             out,
@@ -206,6 +211,7 @@ fn run(cli: Cli, out: &mut impl Write) -> Result<(), Box<dyn Error>> {
             range,
             limit,
         } => {
+            let limit = usize::from(limit);
             let params = desktop_params(&hostname, server_classes(&client));
             let query = queries::full_desktop_query(&params);
             if cli.verbose {
@@ -322,6 +328,20 @@ fn category_name(data: &serde_json::Map<String, serde_json::Value>) -> String {
     }
 }
 
+/// Escape control characters (e.g. terminal escape sequences in a recorded window title)
+/// so printing event data can't drive the terminal.
+fn printable(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
 /// `H:MM:SS`, like Python's `str(timedelta)` without the fractional seconds.
 fn fmt_duration(duration: Duration) -> String {
     let secs = duration.num_seconds().max(0);
@@ -368,6 +388,10 @@ fn write_table(
     headers: &[&str],
     rows: &[Vec<String>],
 ) -> std::io::Result<()> {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| printable(cell)).collect())
+        .collect();
     let widths: Vec<usize> = headers
         .iter()
         .enumerate()
@@ -399,7 +423,7 @@ fn write_table(
         "{}",
         line(widths.iter().map(|w| "-".repeat(*w)).collect())
     )?;
-    for row in rows {
+    for row in &rows {
         writeln!(out, "{}", line(row.clone()))?;
     }
     Ok(())
@@ -437,6 +461,20 @@ mod tests {
             short.ends_with("...") && short.chars().count() <= 20,
             "{short}"
         );
+    }
+
+    #[test]
+    fn escapes_control_characters_in_tables() {
+        let mut out = Vec::new();
+        write_table(
+            &mut out,
+            &["Key"],
+            &[vec!["evil\u{1b}]0;pwned\u{7}\ttitle".into()]],
+        )
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out:?}");
+        assert!(out.contains("evil\\u{1b}]0;pwned\\u{7}\\ttitle"), "{out:?}");
     }
 
     #[test]

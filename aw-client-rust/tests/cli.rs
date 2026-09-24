@@ -30,7 +30,10 @@ fn start_server() -> (u16, rocket::Shutdown) {
         tokio_test::block_on(aw_server::endpoints::build_rocket(state, config).ignite()).unwrap();
     let shutdown = rocket.shutdown();
     std::thread::spawn(move || {
-        let _ = tokio_test::block_on(rocket.launch());
+        // Surface a failed launch (e.g. the port was taken) instead of only timing out later.
+        if let Err(err) = tokio_test::block_on(rocket.launch()) {
+            eprintln!("aw-server failed to launch on port {port}: {err}");
+        }
     });
     (port, shutdown)
 }
@@ -62,7 +65,9 @@ fn aw_client(port: u16, args: &[&str]) -> String {
 fn cli_commands_against_a_server() {
     let (port, shutdown) = start_server();
     let client = AwClient::new("127.0.0.1", port, "aw-client-rust-cli-test").unwrap();
-    client.wait_for_start().unwrap();
+    client
+        .wait_for_start()
+        .expect("aw-server didn't start; see stderr for a launch error");
 
     let host = "clihost";
     let window = format!("aw-watcher-window_{host}");
@@ -114,7 +119,7 @@ fn cli_commands_against_a_server() {
     std::fs::write(&query_file, format!("RETURN = query_bucket(\"{window}\");")).unwrap();
     let query_path = query_file.to_str().unwrap();
     let out = aw_client(port, &["query", query_path]);
-    assert!(out.contains("Showing 10 out of 2 events:"), "{out}");
+    assert!(out.contains("Showing 2 out of 2 events:"), "{out}");
     assert!(out.contains("Total duration:\t 0:15:00"), "{out}");
     let out = aw_client(port, &["query", query_path, "--json"]);
     let json: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -131,8 +136,22 @@ fn cli_commands_against_a_server() {
             "2000-01-02",
         ],
     );
-    assert!(out.contains("Showing 10 out of 0 events:"), "{out}");
+    assert!(out.contains("Showing 0 out of 0 events:"), "{out}");
     let _ = std::fs::remove_file(&query_file);
+
+    // --limit is capped at the query's own limit
+    let output = Command::new(env!("CARGO_BIN_EXE_aw-client"))
+        .args([
+            "--port",
+            &port.to_string(),
+            "report",
+            host,
+            "--limit",
+            "101",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
 
     // report: categorized with the default classes (no classes setting on the server)
     let out = aw_client(port, &["report", host]);
