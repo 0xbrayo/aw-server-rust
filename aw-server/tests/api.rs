@@ -802,7 +802,26 @@ mod api_tests {
         assert_eq!(res.status(), rocket::http::Status::Ok);
         assert_eq!(
             res.into_string().unwrap(),
-            r#"[[{"data":{},"duration":1.0,"id":1,"timestamp":"2018-01-01T01:01:01Z"}]]"#
+            r#"[[{"id":1,"timestamp":"2018-01-01T01:01:01Z","duration":1.0,"data":{}}]]"#
+        );
+
+        // Dict keys are serialized in sorted order, not HashMap order, so the
+        // response body is deterministic.
+        let res = client
+            .post("/api/0/query")
+            .header(ContentType::JSON)
+            .header(Header::new("Host", "127.0.0.1:5600"))
+            .body(
+                r#"{
+                "timeperiods": ["2000-01-01T00:00:00Z/2020-01-01T00:00:00Z"],
+                "query": ["return {\"d\": 4, \"b\": 2, \"a\": {\"z\": 1, \"y\": 2}, \"c\": 3};"]
+            }"#,
+            )
+            .dispatch();
+        assert_eq!(res.status(), rocket::http::Status::Ok);
+        assert_eq!(
+            res.into_string().unwrap(),
+            r#"[{"a":{"y":2.0,"z":1.0},"b":2.0,"c":3.0,"d":4.0}]"#
         );
 
         // Test error
