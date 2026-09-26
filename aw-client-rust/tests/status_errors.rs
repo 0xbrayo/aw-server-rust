@@ -188,6 +188,7 @@ fn bucket_ids_and_setting_keys_are_encoded_as_one_path_segment() {
         respond(""),
         respond(""),
         respond("null"),
+        respond("null"),
     ]);
     let client = AwClient::new("127.0.0.1", port, "aw-client-rust-test").expect("create client");
     let bucket = "a#b?c/d";
@@ -204,6 +205,7 @@ fn bucket_ids_and_setting_keys_are_encoded_as_one_path_segment() {
     block_on(client.delete_event(bucket, 7)).expect("delete event");
     block_on(client.delete_bucket(bucket)).expect("delete bucket");
     block_on(client.get_setting("ui#theme")).expect("get setting");
+    block_on(client.get_event(bucket, 7)).expect("get event");
 
     let requests = handle.join().expect("join mock server");
     assert_eq!(
@@ -215,6 +217,7 @@ fn bucket_ids_and_setting_keys_are_encoded_as_one_path_segment() {
             "DELETE /api/0/buckets/a%23b%3Fc%2Fd/events/7 HTTP/1.1",
             "DELETE /api/0/buckets/a%23b%3Fc%2Fd HTTP/1.1",
             "GET /api/0/settings/ui%23theme HTTP/1.1",
+            "GET /api/0/buckets/a%23b%3Fc%2Fd/events/7 HTTP/1.1",
         ]
     );
 }
