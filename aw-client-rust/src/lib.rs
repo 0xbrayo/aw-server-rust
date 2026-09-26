@@ -7,6 +7,7 @@ extern crate tokio;
 
 pub mod blocking;
 pub mod classes;
+pub mod config;
 pub mod queries;
 pub mod queue;
 pub mod single_instance;
@@ -78,6 +79,18 @@ impl AwClient {
 
     pub fn new(host: &str, port: u16, name: &str) -> Result<AwClient, Box<dyn Error>> {
         Self::new_with_api_key(host, port, name, None)
+    }
+
+    /// Connect to the server set in `aw-client.toml` (see [`config`]), the file the Python
+    /// client reads. `testing` selects the `[server-testing]` section, whose default port
+    /// is 5666.
+    pub fn from_config(
+        name: &str,
+        testing: bool,
+        api_key: Option<String>,
+    ) -> Result<AwClient, Box<dyn Error>> {
+        let config = config::load_config(testing);
+        Self::new_with_api_key(&config.hostname, config.port, name, api_key)
     }
 
     pub fn new_with_api_key(
