@@ -188,7 +188,7 @@ fn bucket_ids_and_setting_keys_are_encoded_as_one_path_segment() {
         respond(""),
         respond(""),
         respond("null"),
-        respond("null"),
+        respond(r#"{"id":7,"timestamp":"2024-01-01T00:00:00Z","duration":0.0,"data":{}}"#),
     ]);
     let client = AwClient::new("127.0.0.1", port, "aw-client-rust-test").expect("create client");
     let bucket = "a#b?c/d";
