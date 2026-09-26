@@ -25,6 +25,7 @@ mod worker;
 
 pub use self::datastore::DatastoreInstance;
 pub use self::datastore::NEWEST_DB_VERSION;
+
 pub use self::worker::Datastore;
 
 #[derive(Clone)]

@@ -54,7 +54,7 @@ mod api_tests {
             assert_eq!(response.content_type(), Some(ContentType::JSON));
             assert_eq!(
                 response.headers().get_one("Content-Disposition"),
-                Some("attachment; filename=aw-bucket-export_live.json")
+                Some("attachment; filename=\"aw-bucket-export_live.json\"")
             );
             let body: Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
             assert_eq!(
@@ -83,7 +83,7 @@ mod api_tests {
         assert_eq!(response.content_type(), Some(ContentType::JSON));
         assert_eq!(
             response.headers().get_one("Content-Disposition"),
-            Some("attachment; filename=aw-buckets-export.json")
+            Some("attachment; filename=\"aw-buckets-export.json\"")
         );
         let body: Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
         assert_eq!(body["buckets"], json!({}));
@@ -135,6 +135,70 @@ mod api_tests {
                 .len(),
             128 * 1024
         );
+    }
+
+    #[test]
+    fn csv_export_returns_csv_with_correct_headers_and_missing_bucket_errors() {
+        let server = setup_testserver();
+        let datastore = server
+            .state::<endpoints::ServerState>()
+            .unwrap()
+            .datastore
+            .clone();
+        let bucket: Bucket = serde_json::from_value(json!({
+            "id": "testbucket", "type": "test", "client": "test", "hostname": "test"
+        }))
+        .unwrap();
+        datastore.create_bucket(&bucket).unwrap();
+        let mut event = aw_models::Event {
+            duration: chrono::Duration::nanoseconds(1_500_000),
+            ..Default::default()
+        };
+        event.data.insert("app".into(), json!("firefox"));
+        event
+            .data
+            .insert("title".into(), json!("A \"quoted\" title"));
+        event.data.insert("formula".into(), json!("=cmd|calc"));
+        let inserted = datastore.insert_events("testbucket", &[event]).unwrap();
+
+        let client = Client::untracked(server).unwrap();
+        let response = client
+            .get("/api/0/buckets/testbucket/export/csv")
+            .header(Header::new("Host", "127.0.0.1:5600"))
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.content_type(),
+            Some(ContentType::new("text", "csv"))
+        );
+        assert_eq!(
+            response.headers().get_one("Content-Disposition"),
+            Some("attachment; filename=\"aw-events-export-testbucket.csv\"")
+        );
+        let body = response.into_string().unwrap();
+        // Header row
+        assert!(body.starts_with("id,timestamp,duration,"), "header: {body}");
+        // Quoted field for title with embedded double-quote
+        assert!(
+            body.contains("\"A \"\"quoted\"\" title\""),
+            "quoting: {body}"
+        );
+        // Sub-millisecond duration is not truncated to 0.001000000
+        assert!(body.contains("0.001500000"), "duration: {body}");
+        // Spreadsheet formula prefixes are neutralized
+        assert!(body.contains("'=cmd|calc"), "formula: {body}");
+        // Event id present
+        let event_id = inserted[0].id.unwrap().to_string();
+        assert!(body.contains(&event_id), "id in body: {body}");
+
+        // Missing bucket → 404 with JSON body
+        let response = client
+            .get("/api/0/buckets/nosuchbucket/export/csv")
+            .header(Header::new("Host", "127.0.0.1:5600"))
+            .dispatch();
+        assert_eq!(response.status(), Status::NotFound);
+        let body: Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
+        assert!(body["message"].as_str().unwrap().contains("does not exist"));
     }
 
     #[test]

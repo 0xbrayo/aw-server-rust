@@ -227,7 +227,12 @@ fn _migrate_v5_to_v6(conn: &Connection) {
 // bucket's time span as a cheap selectivity estimate; this affects performance,
 // never which rows qualify. Limited queries retain their ordered starttime scan
 // so LIMIT can stop early without sorting all matching rows.
-fn prefer_endtime_index(bucket: &Bucket, start: i64, end: i64, limit: Option<u64>) -> bool {
+pub(crate) fn prefer_endtime_index(
+    bucket: &Bucket,
+    start: i64,
+    end: i64,
+    limit: Option<u64>,
+) -> bool {
     if limit.is_some() {
         return false;
     }
@@ -687,6 +692,29 @@ impl DatastoreInstance {
             (self.buckets_cache.len() == 1)
                 .then(|| self.buckets_cache.keys().next().unwrap().clone())
         }))
+    }
+
+    /// Stream one bucket's events as RFC-4180 CSV, one row at a time.
+    ///
+    /// Uses the same filters, clipping, and corrupt-row policy as `get_events`.
+    pub fn write_events_csv(
+        &self,
+        conn: &Connection,
+        bucket_id: &str,
+        start: Option<chrono::DateTime<chrono::Utc>>,
+        end: Option<chrono::DateTime<chrono::Utc>>,
+        limit: Option<u64>,
+        writer: impl std::io::Write,
+    ) -> Result<(), DatastoreError> {
+        crate::export::write_events_csv(
+            conn,
+            &self.buckets_cache,
+            bucket_id,
+            start,
+            end,
+            limit,
+            writer,
+        )
     }
 
     pub fn insert_events(
