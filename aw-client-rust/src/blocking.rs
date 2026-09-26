@@ -91,6 +91,17 @@ impl AwClient {
     proxy_method!(get_setting, serde_json::Value, setting: &str);
     proxy_method!(get_settings, aw_models::Settings,);
 
+    pub fn request_queue(&self, testing: bool) -> std::io::Result<crate::queue::RequestQueue> {
+        self.client.request_queue(testing)
+    }
+
+    pub fn request_queue_at(
+        &self,
+        path: std::path::PathBuf,
+    ) -> std::io::Result<crate::queue::RequestQueue> {
+        self.client.request_queue_at(path)
+    }
+
     pub fn wait_for_start(&self) -> Result<(), Box<dyn Error>> {
         block_on(self.client.wait_for_start())
     }
