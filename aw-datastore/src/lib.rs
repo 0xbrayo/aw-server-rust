@@ -59,6 +59,7 @@ pub enum DatastoreError {
     NoSuchBucket(String),
     BucketAlreadyExists(String),
     NoSuchKey(String),
+    NoSuchEvent(String, i64),
     MpscError,
     InternalError(String),
     // Errors specific to when migrate is disabled

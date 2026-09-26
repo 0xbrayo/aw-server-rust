@@ -256,9 +256,13 @@ RETURN = events;",
         let query_result = client.query(&query, vec![timeperiods]).unwrap();
         println!("Query result: {query_result:?}");
 
-        client
-            .delete_event(&bucketname, events[0].id.unwrap())
-            .unwrap();
+        let event_id = events[0].id.unwrap();
+        let fetched = client.get_event(&bucketname, event_id).unwrap().unwrap();
+        assert_eq!(fetched.id, Some(event_id));
+        assert_eq!(fetched.duration, Duration::seconds(1));
+
+        client.delete_event(&bucketname, event_id).unwrap();
+        assert!(client.get_event(&bucketname, event_id).unwrap().is_none());
 
         let count = client.get_event_count(&bucketname).unwrap();
         assert_eq!(count, 0);

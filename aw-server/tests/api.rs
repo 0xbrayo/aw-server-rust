@@ -506,6 +506,13 @@ mod api_tests {
             .header(Header::new("Host", "127.0.0.1:5600"))
             .dispatch();
 
+        // Get deleted event
+        let res = client
+            .get("/api/0/buckets/id/events/1")
+            .header(Header::new("Host", "127.0.0.1:5600"))
+            .dispatch();
+        assert_eq!(res.status(), rocket::http::Status::NotFound);
+
         // Get eventcount
         let res = client
             .get("/api/0/buckets/id/events/count")
