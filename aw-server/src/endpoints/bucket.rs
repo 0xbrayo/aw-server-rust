@@ -13,7 +13,7 @@ use aw_models::Event;
 use rocket::http::Status;
 use rocket::State;
 
-use crate::endpoints::util::BucketsExportRocket;
+use crate::endpoints::util::{BucketEventsCsvRocket, BucketsExportRocket};
 use crate::endpoints::{HttpErrorJson, ServerState};
 
 #[get("/")]
@@ -221,6 +221,49 @@ pub fn bucket_export(
     state: &State<ServerState>,
 ) -> Result<BucketsExportRocket, HttpErrorJson> {
     BucketsExportRocket::new(&state.datastore, Some(bucket_id))
+}
+
+/// Stream events for a single bucket as a CSV file.
+///
+/// Mirrors `GET /<bucket_id>/export` (JSON) but returns `text/csv`.
+/// Sends HTTP headers before serialization begins so large buckets don't
+/// look like a hung connection on Android WebView or slow networks.
+/// Accepts the same `start`, `end`, and `limit` query params as the JSON
+/// events endpoint.
+#[get("/<bucket_id>/export/csv?<start>&<end>&<limit>")]
+pub fn bucket_events_get_csv(
+    bucket_id: &str,
+    start: Option<String>,
+    end: Option<String>,
+    limit: Option<u64>,
+    state: &State<ServerState>,
+) -> Result<BucketEventsCsvRocket, HttpErrorJson> {
+    let starttime: Option<DateTime<Utc>> = match start {
+        Some(dt_str) => match DateTime::parse_from_rfc3339(&dt_str) {
+            Ok(dt) => Some(dt.with_timezone(&Utc)),
+            Err(e) => {
+                let err_msg = format!(
+                    "Failed to parse starttime, datetime needs to be in rfc3339 format: {e}"
+                );
+                warn!("{}", err_msg);
+                return Err(HttpErrorJson::new(Status::BadRequest, err_msg));
+            }
+        },
+        None => None,
+    };
+    let endtime: Option<DateTime<Utc>> = match end {
+        Some(dt_str) => match DateTime::parse_from_rfc3339(&dt_str) {
+            Ok(dt) => Some(dt.with_timezone(&Utc)),
+            Err(e) => {
+                let err_msg =
+                    format!("Failed to parse endtime, datetime needs to be in rfc3339 format: {e}");
+                warn!("{}", err_msg);
+                return Err(HttpErrorJson::new(Status::BadRequest, err_msg));
+            }
+        },
+        None => None,
+    };
+    BucketEventsCsvRocket::new(&state.datastore, bucket_id, starttime, endtime, limit)
 }
 
 #[delete("/<bucket_id>")]

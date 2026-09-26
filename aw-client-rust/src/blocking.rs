@@ -41,6 +41,15 @@ impl AwClient {
         Self::new_with_api_key(host, port, name, None)
     }
 
+    pub fn from_config(
+        name: &str,
+        testing: bool,
+        api_key: Option<String>,
+    ) -> Result<AwClient, Box<dyn Error>> {
+        let config = crate::config::load_config(testing);
+        Self::new_with_api_key(&config.hostname, config.port, name, api_key)
+    }
+
     pub fn new_with_api_key(
         host: &str,
         port: u16,
@@ -76,6 +85,7 @@ impl AwClient {
         query: &str,
         timeperiods: Vec<(DateTime<Utc>, DateTime<Utc>)>
     );
+    proxy_method!(get_event, Option<Event>, bucketname: &str, event_id: i64);
     proxy_method!(insert_event, (), bucketname: &str, event: &Event);
     proxy_method!(insert_events, (), bucketname: &str, events: Vec<Event>);
     proxy_method!(
@@ -109,12 +119,26 @@ impl AwClient {
 
 #[test]
 fn test_wait_for_start_blocking_wrapper() {
+    use std::io::{BufRead, BufReader, Write};
+
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let client = AwClient::new(
-        "127.0.0.1",
-        listener.local_addr().unwrap().port(),
-        "test-wait-for-start-blocking",
-    )
-    .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server =
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                line.clear();
+            }
+            stream
+            .write_all(concat!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 74\r\nConnection: close\r\n\r\n",
+                r#"{"hostname":"host","version":"v0.0.0","testing":true,"device_id":"device"}"#
+            ).as_bytes())
+            .unwrap();
+        });
+    let client = AwClient::new("127.0.0.1", port, "test-wait-for-start-blocking").unwrap();
     client.wait_for_start().unwrap();
+    server.join().unwrap();
 }

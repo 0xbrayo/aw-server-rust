@@ -173,6 +173,7 @@ fn creates_registered_buckets_then_delivers_heartbeats_in_order() {
             .heartbeat("bucket a", &event(second, app), 5.0)
             .unwrap();
     }
+    queue.flush().unwrap();
     wait_until("the queue to drain", || queue.is_empty());
     assert!(queue.is_connected());
     queue.stop();
@@ -217,6 +218,7 @@ fn keeps_heartbeats_while_server_is_down_and_sends_them_later() {
     let queue = client.request_queue_at(path.clone()).unwrap();
     queue.heartbeat("bucket", &event(0, "one"), 5.0).unwrap();
     queue.heartbeat("bucket", &event(1, "two"), 5.0).unwrap();
+    queue.flush().unwrap();
     assert_eq!(queue.len(), 2);
     queue.stop();
 
@@ -258,6 +260,7 @@ fn drops_bad_requests_and_retries_server_errors() {
     queue
         .heartbeat("bucket", &event(1, "retried"), 5.0)
         .unwrap();
+    queue.flush().unwrap();
     wait_until("the queue to drain", || queue.is_empty());
     queue.stop();
 
@@ -371,6 +374,7 @@ fn a_missing_bucket_is_recreated_and_temporary_errors_retried() {
     let queue = client.request_queue_at(queue_path("missing")).unwrap();
     queue.register_bucket("window", "currentwindow");
     queue.heartbeat("window", &event(0, "one"), 5.0).unwrap();
+    queue.flush().unwrap();
     wait_until("the queue to drain", || queue.is_empty());
     queue.stop();
 
@@ -401,6 +405,7 @@ fn heartbeats_to_an_unknown_missing_bucket_are_dropped() {
     queue
         .heartbeat("never-registered", &event(0, "one"), 5.0)
         .unwrap();
+    queue.flush().unwrap();
     wait_until("the queue to drain", || queue.is_empty());
     queue.stop();
     assert_eq!(
@@ -483,6 +488,7 @@ fn transient_errors_creating_a_bucket_are_retried() {
     let queue = client.request_queue_at(queue_path("create-retry")).unwrap();
     queue.register_bucket("window", "currentwindow");
     queue.heartbeat("window", &event(0, "one"), 5.0).unwrap();
+    queue.flush().unwrap();
     // Registering again wakes the worker instead of waiting out the reconnect interval.
     // A registration made while an attempt is in flight must not be lost.
     let attempts = || {
@@ -514,4 +520,100 @@ fn transient_errors_creating_a_bucket_are_retried() {
             .contains(&"POST /api/0/buckets/window/heartbeat?pulsetime=5 HTTP/1.1".to_string()),
         "{lines:?}"
     );
+}
+
+fn delivered_heartbeats(server: &MockServer) -> Vec<Event> {
+    let requests = server.requests.lock().unwrap();
+    requests
+        .iter()
+        .filter(|(line, _)| line.contains("/heartbeat"))
+        .map(|(_, body)| serde_json::from_str(body).unwrap())
+        .collect()
+}
+
+#[test]
+fn premerges_heartbeats_until_the_commit_interval() {
+    let server = MockServer::start(|_| 200);
+    let client = AwClient::new("127.0.0.1", server.port, &unique("premerge")).unwrap();
+    let queue = client.request_queue_at(queue_path("premerge")).unwrap();
+    queue.set_commit_interval(10.0);
+
+    // One heartbeat a second for 12 seconds, all with the same data.
+    for second in 0..12 {
+        queue
+            .heartbeat("bucket", &event(second, "editor"), 5.0)
+            .unwrap();
+    }
+    // Only the event that reached 10 s was queued; the rest is still being merged.
+    wait_until("the committed heartbeat", || {
+        queue.is_empty() && delivered_heartbeats(&server).len() == 1
+    });
+    queue.flush().unwrap();
+    wait_until("the flushed heartbeat", || {
+        queue.is_empty() && delivered_heartbeats(&server).len() == 2
+    });
+    queue.stop();
+
+    let sent = delivered_heartbeats(&server);
+    assert_eq!(sent[0].timestamp, event(0, "editor").timestamp);
+    assert_eq!(sent[0].duration, chrono::Duration::seconds(10));
+    assert_eq!(sent[1].timestamp, event(10, "editor").timestamp);
+    assert_eq!(sent[1].duration, chrono::Duration::seconds(1));
+}
+
+#[test]
+fn a_data_change_sends_the_merged_heartbeat() {
+    let server = MockServer::start(|_| 200);
+    let client = AwClient::new("127.0.0.1", server.port, &unique("change")).unwrap();
+    let queue = client.request_queue_at(queue_path("change")).unwrap();
+
+    for second in 0..3 {
+        queue
+            .heartbeat("bucket", &event(second, "editor"), 5.0)
+            .unwrap();
+    }
+    queue
+        .heartbeat("bucket", &event(3, "browser"), 5.0)
+        .unwrap();
+    wait_until("the merged heartbeat", || {
+        queue.is_empty() && delivered_heartbeats(&server).len() == 1
+    });
+    queue.stop();
+
+    let sent = delivered_heartbeats(&server);
+    assert_eq!(sent[0].data["app"], "editor");
+    assert_eq!(sent[0].timestamp, event(0, "editor").timestamp);
+    assert_eq!(sent[0].duration, chrono::Duration::seconds(2));
+}
+
+#[test]
+fn stopping_keeps_pending_merged_heartbeats() {
+    let path = queue_path("pending");
+    let client = AwClient::new("127.0.0.1", closed_port(), &unique("pending")).unwrap();
+    let queue = client.request_queue_at(path.clone()).unwrap();
+    queue.heartbeat("a", &event(0, "editor"), 5.0).unwrap();
+    queue.heartbeat("a", &event(1, "editor"), 5.0).unwrap();
+    queue.heartbeat("b", &event(0, "browser"), 5.0).unwrap();
+    assert_eq!(queue.len(), 0, "nothing reached the commit interval yet");
+    queue.stop();
+
+    let queue = client.request_queue_at(path).unwrap();
+    assert_eq!(queue.len(), 2);
+    queue.stop();
+}
+
+#[test]
+fn merged_heartbeats_keep_the_bucket_type() {
+    let path = queue_path("merged-type");
+    let client = AwClient::new("127.0.0.1", closed_port(), &unique("merged-type")).unwrap();
+    let queue = client.request_queue_at(path.clone()).unwrap();
+    queue.register_bucket("window", "currentwindow");
+    queue.heartbeat("window", &event(0, "editor"), 5.0).unwrap();
+    queue.heartbeat("window", &event(1, "editor"), 5.0).unwrap();
+    queue.stop();
+
+    let line = std::fs::read_to_string(&path).unwrap();
+    let queued: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(queued["bucket_type"], "currentwindow");
+    assert_eq!(queued["event"]["duration"], 1.0);
 }

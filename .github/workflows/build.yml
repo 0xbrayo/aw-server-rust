@@ -37,6 +37,8 @@ jobs:
       run: cargo test --workspace --verbose
     - name: Run aw-sync v2 tests (sync-v2 feature)
       run: cargo test -p aw-sync --features sync-v2 v2 --verbose
+    - name: Run aw-client CLI tests (cli feature)
+      run: cargo test -p aw-client-rust --features cli --verbose
     - uses: actions/upload-artifact@v7
       with:
         # TODO: These binaries are debug builds

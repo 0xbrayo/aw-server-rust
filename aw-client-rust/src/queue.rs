@@ -9,6 +9,13 @@
 //! buckets it has heartbeats for, and a bucket that disappears (a 404) is recreated
 //! rather than its heartbeats dropped.
 //!
+//! Like `heartbeat(..., queued=True)` in Python, heartbeats are pre-merged: consecutive
+//! heartbeats with the same data are merged in memory (with the server's own merge rule,
+//! [`aw_transform::heartbeat`]) and queued once the merged event spans the commit
+//! interval, or when the data changes. A watcher sending a heartbeat every second then
+//! queues one request per commit interval rather than one per heartbeat. Pending merged
+//! heartbeats are flushed to the queue when it stops.
+//!
 //! Delivery follows the Python client, retrying a little more: connection failures,
 //! timeouts, 408, 429 and 5xx responses are retried; a 400 (a payload that will never be
 //! accepted) and any other error are logged and the heartbeat is dropped.
@@ -19,7 +26,7 @@
 //! small write. A crash can make the queue re-send heartbeats, but never skip one. A
 //! `.lock` file keeps two queues from using the same file at once.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -39,6 +46,11 @@ const QUEUE_VERSION: u32 = 1;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
 /// Pause after a failed delivery before retrying it.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Default seconds a merged heartbeat may span before it's queued; Python's default
+/// `commit_interval`.
+pub const DEFAULT_COMMIT_INTERVAL: f64 = 10.0;
+/// Python's default `commit_interval` for the testing profile.
+pub(crate) const DEFAULT_COMMIT_INTERVAL_TESTING: f64 = 5.0;
 /// Upper bound for one request, so stopping the queue never waits on a hung server
 /// for the client's full timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -142,6 +154,9 @@ struct State {
     /// Set by [`Shared::notify`] and consumed by [`Shared::wait`], so a wake-up sent
     /// while the worker is busy (not yet waiting) isn't lost.
     woken: bool,
+    /// Per bucket, the merged heartbeat not yet queued and its pulsetime.
+    pending: HashMap<String, (Event, f64)>,
+    commit_interval: f64,
 }
 
 impl State {
@@ -264,6 +279,8 @@ impl RequestQueue {
                 connected: false,
                 stop: false,
                 woken: false,
+                pending: HashMap::new(),
+                commit_interval: DEFAULT_COMMIT_INTERVAL,
             }),
             wake: Condvar::new(),
         });
@@ -292,24 +309,63 @@ impl RequestQueue {
         self.shared.notify(state);
     }
 
-    /// Queue a heartbeat. It's synced to the queue file before this returns and
-    /// delivered in order by the background thread.
+    /// Seconds a merged heartbeat may span before it's queued (default
+    /// [`DEFAULT_COMMIT_INTERVAL`]).
+    pub fn set_commit_interval(&self, seconds: f64) {
+        self.shared.lock().commit_interval = seconds;
+    }
+
+    /// Record a heartbeat, pre-merging it with the previous one for the bucket (see the
+    /// [module docs](self)). Whatever gets queued is synced to the queue file before this
+    /// returns and delivered in order by the background thread. If that write fails, the
+    /// merged heartbeat stays pending, so nothing recorded so far is lost.
     pub fn heartbeat(&self, bucket_id: &str, event: &Event, pulsetime: f64) -> io::Result<()> {
         let mut state = self.shared.lock();
-        let request = QueuedHeartbeat {
-            bucket_id: bucket_id.to_string(),
-            bucket_type: state.bucket_type(bucket_id),
-            pulsetime,
-            event: event.clone(),
+        let Some((last, last_pulsetime)) = state.pending.get(bucket_id).cloned() else {
+            state
+                .pending
+                .insert(bucket_id.to_string(), (event.clone(), pulsetime));
+            return Ok(());
         };
-        state.log.append(&request)?;
-        state.queue.push_back(request);
+        let (queue, keep) = match aw_transform::heartbeat(&last, event, pulsetime) {
+            // Long enough: send it, and start merging again from this heartbeat.
+            Some(merged) if duration_secs(&merged) >= state.commit_interval => {
+                (Some((merged, pulsetime)), (event.clone(), pulsetime))
+            }
+            Some(merged) => (None, (merged, pulsetime)),
+            // Data changed or there was a gap: send what we had, keep the new one.
+            None => (Some((last, last_pulsetime)), (event.clone(), pulsetime)),
+        };
+        let queued = queue.is_some();
+        if let Some((event, pulsetime)) = queue {
+            // On failure `pending` still holds the previous merged heartbeat.
+            enqueue(&mut state, bucket_id, event, pulsetime)?;
+        }
+        state.pending.insert(bucket_id.to_string(), keep);
         // While disconnected the worker is waiting out the reconnect interval; waking it
         // for every heartbeat would turn that into a reconnect attempt per heartbeat.
-        if state.connected {
+        if queued && state.connected {
             self.shared.notify(state);
         }
         Ok(())
+    }
+
+    /// Queue every pending merged heartbeat now, without waiting for the commit interval.
+    /// A heartbeat whose write fails stays pending.
+    pub fn flush(&self) -> io::Result<()> {
+        let mut state = self.shared.lock();
+        let mut bucket_ids: Vec<String> = state.pending.keys().cloned().collect();
+        bucket_ids.sort();
+        let result = bucket_ids.iter().try_for_each(|bucket_id| {
+            let (event, pulsetime) = state.pending[bucket_id].clone();
+            enqueue(&mut state, bucket_id, event, pulsetime)?;
+            state.pending.remove(bucket_id);
+            Ok(())
+        });
+        if state.connected {
+            self.shared.notify(state);
+        }
+        result
     }
 
     /// Number of heartbeats not yet delivered.
@@ -337,6 +393,11 @@ impl RequestQueue {
     }
 
     fn shutdown(&mut self) {
+        // Keep merged heartbeats that haven't reached the commit interval: they're sent by
+        // the next queue opened on this file.
+        if let Err(err) = self.flush() {
+            log::error!("Failed to queue pending heartbeats on stop: {err}");
+        }
         let mut state = self.shared.lock();
         state.stop = true;
         self.shared.notify(state);
@@ -352,6 +413,22 @@ impl Drop for RequestQueue {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+fn duration_secs(event: &Event) -> f64 {
+    event.duration.num_milliseconds() as f64 / 1000.0
+}
+
+fn enqueue(state: &mut State, bucket_id: &str, event: Event, pulsetime: f64) -> io::Result<()> {
+    let request = QueuedHeartbeat {
+        bucket_id: bucket_id.to_string(),
+        bucket_type: state.bucket_type(bucket_id),
+        pulsetime,
+        event,
+    };
+    state.log.append(&request)?;
+    state.queue.push_back(request);
+    Ok(())
 }
 
 #[derive(Debug, PartialEq)]

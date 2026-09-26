@@ -463,6 +463,15 @@ mod datastore_tests {
         let fetched_event = ds.get_event(&bucket.id, first_event_id).unwrap();
         // TODO: Check entire events to ensure integrity
         assert_eq!(fetched_event.id.unwrap(), first_event_id);
+
+        let missing_id = first_event_id + 1000;
+        match ds.get_event(&bucket.id, missing_id) {
+            Err(DatastoreError::NoSuchEvent(bid, eid)) => {
+                assert_eq!(bid, bucket.id);
+                assert_eq!(eid, missing_id);
+            }
+            other => panic!("expected NoSuchEvent, got {other:?}"),
+        }
     }
 
     #[test]

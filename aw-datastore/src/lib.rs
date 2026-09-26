@@ -25,6 +25,7 @@ mod worker;
 
 pub use self::datastore::DatastoreInstance;
 pub use self::datastore::NEWEST_DB_VERSION;
+
 pub use self::worker::Datastore;
 
 #[derive(Clone)]
@@ -58,6 +59,7 @@ pub enum DatastoreError {
     NoSuchBucket(String),
     BucketAlreadyExists(String),
     NoSuchKey(String),
+    NoSuchEvent(String, i64),
     MpscError,
     InternalError(String),
     // Errors specific to when migrate is disabled
