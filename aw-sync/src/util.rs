@@ -87,17 +87,12 @@ pub fn host_for_url(host: &str) -> String {
 mod tests {
     use super::{get_server_config, host_for_url, is_loopback_host};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn reads_port_and_api_key_from_config_override() {
         let config_path = std::env::temp_dir().join(format!(
-            "aw-sync-config-{}-{}.toml",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-config-{}.toml",
+            crate::util::unique_test_suffix(),
         ));
         fs::write(
             &config_path,
@@ -116,7 +111,7 @@ mod tests {
     fn missing_config_override_uses_defaults() {
         let config_path = std::env::temp_dir().join(format!(
             "missing-aw-sync-config-{}.toml",
-            std::process::id()
+            crate::util::unique_test_suffix()
         ));
         let _ = fs::remove_file(&config_path);
 
@@ -132,12 +127,8 @@ mod tests {
     #[test]
     fn commented_or_empty_api_key_is_absent() {
         let config_path = std::env::temp_dir().join(format!(
-            "aw-sync-config-commented-{}-{}.toml",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-config-commented-{}.toml",
+            crate::util::unique_test_suffix(),
         ));
         fs::write(
             &config_path,
@@ -170,12 +161,8 @@ mod tests {
 
     fn temp_sync_root() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "aw-sync-remotes-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-remotes-{}",
+            crate::util::unique_test_suffix(),
         ));
         fs::create_dir_all(&p).unwrap();
         p
@@ -680,6 +667,24 @@ pub(crate) fn find_remotes_nonlocal_selection(
         })
         .collect();
     Ok(paths_to_remote_selection(filtered))
+}
+
+/// A unique suffix for test temp paths: process id, time, and a per-process counter.
+/// The clock alone isn't enough: macOS reports time in microseconds, so tests running in
+/// parallel could get the same name and delete each other's files.
+#[cfg(test)]
+pub(crate) fn unique_test_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Collapse `{…}/{device_id}/*.db` paths to the largest file per device_id.
@@ -1236,16 +1241,11 @@ fn ns_to_datetime(ns: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 mod scan_tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_sync_dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "aw-sync-scan-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-scan-{}",
+            crate::util::unique_test_suffix(),
         ));
         fs::create_dir_all(&path).unwrap();
         path

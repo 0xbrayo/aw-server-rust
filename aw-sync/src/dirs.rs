@@ -222,12 +222,8 @@ mod tests {
         use aw_server::dirs::appname_for_in;
         use std::fs;
         let root = std::env::temp_dir().join(format!(
-            "aw-sync-profile-tests-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-profile-tests-{}",
+            crate::util::unique_test_suffix(),
         ));
         let data = root.join("data");
         let config = root.join("config");
@@ -325,12 +321,8 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     fn temp_sync_config_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "aw-sync-config-tests-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-config-tests-{label}-{}",
+            crate::util::unique_test_suffix(),
         ))
     }
 
