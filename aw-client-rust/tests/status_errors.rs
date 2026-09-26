@@ -20,15 +20,19 @@ struct MockResponse {
     body: &'static str,
 }
 
-/// Drain the HTTP request fully before responding.
+/// Drain the HTTP request fully before responding, returning its request line.
 ///
 /// Parses Content-Length from headers so POST body data (which may arrive
 /// in a separate TCP segment) is consumed before the mock writes its
 /// response. Without this, reqwest may see a broken pipe on loopback if
 /// the response arrives before the body finishes sending.
-fn drain_request(stream: &mut impl Read) {
+fn drain_request(stream: &mut impl Read) -> String {
     let mut reader = BufReader::new(stream);
     let mut content_length = 0_usize;
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .expect("read request line");
     let mut line = String::new();
     loop {
         line.clear();
@@ -51,15 +55,18 @@ fn drain_request(stream: &mut impl Read) {
             .read_exact(&mut body_buf)
             .expect("drain request body");
     }
+    request_line.trim().to_string()
 }
 
-fn spawn_mock_server(responses: Vec<MockResponse>) -> (u16, thread::JoinHandle<()>) {
+/// The join handle yields the request line of every request the mock served.
+fn spawn_mock_server(responses: Vec<MockResponse>) -> (u16, thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
     let port = listener.local_addr().expect("mock server addr").port();
     let handle = thread::spawn(move || {
+        let mut request_lines = Vec::new();
         for response in responses {
             let (mut stream, _) = listener.accept().expect("accept request");
-            drain_request(&mut stream);
+            request_lines.push(drain_request(&mut stream));
             let body = response.body.as_bytes();
             write!(
                 stream,
@@ -72,6 +79,7 @@ fn spawn_mock_server(responses: Vec<MockResponse>) -> (u16, thread::JoinHandle<(
             .expect("write response");
             stream.flush().expect("flush response");
         }
+        request_lines
     });
     (port, handle)
 }
@@ -164,4 +172,39 @@ fn get_event_maps_404_to_none_and_rejects_other_errors() {
     );
 
     handle.join().expect("join mock server");
+}
+
+#[test]
+fn get_event_count_sends_time_filters() {
+    let count = || MockResponse {
+        status_line: "200 OK",
+        content_type: "application/json",
+        body: "3",
+    };
+    let (port, handle) = spawn_mock_server(vec![count(), count()]);
+    let client =
+        blocking::AwClient::new("127.0.0.1", port, "aw-client-rust-test").expect("create client");
+    let start = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let end = chrono::DateTime::parse_from_rfc3339("2024-01-02T00:00:00+00:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    assert_eq!(client.get_event_count("bucket", None, None).unwrap(), 3);
+    assert_eq!(
+        client
+            .get_event_count("bucket", Some(start), Some(end))
+            .unwrap(),
+        3
+    );
+
+    let requests = handle.join().expect("join mock server");
+    assert_eq!(
+        requests,
+        vec![
+            "GET /api/0/buckets/bucket/events/count HTTP/1.1",
+            "GET /api/0/buckets/bucket/events/count?start=2024-01-01T00%3A00%3A00%2B00%3A00&end=2024-01-02T00%3A00%3A00%2B00%3A00 HTTP/1.1",
+        ]
+    );
 }
