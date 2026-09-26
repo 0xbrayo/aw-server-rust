@@ -1259,16 +1259,11 @@ fn log_buckets(ds: &dyn AccessMethod) -> Result<(), String> {
 #[cfg(test)]
 mod pull_only_staging_tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "aw-sync-pull-only-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-pull-only-{}",
+            crate::util::unique_test_suffix(),
         ));
         fs::create_dir_all(&p).unwrap();
         p
@@ -1532,7 +1527,6 @@ mod hostname_sanitize_tests {
 #[cfg(test)]
 mod peer_isolation_tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use aw_models::Bucket;
 
@@ -1564,13 +1558,9 @@ mod peer_isolation_tests {
     /// fails. Unique per call so the test is hermetic.
     fn unreadable_peer(label: &str) -> Datastore {
         let path = std::env::temp_dir().join(format!(
-            "aw-sync-missing-{}-{}-{}/peer.db",
+            "aw-sync-missing-{}-{}/peer.db",
             label,
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            crate::util::unique_test_suffix(),
         ));
         create_datastore(&path).expect("path is valid UTF-8")
     }
@@ -1640,12 +1630,8 @@ mod peer_isolation_tests {
         // Peer open is read-only and fails on a missing file.
         // create_datastore would have succeeded (lazy worker) and hidden this.
         let missing = std::env::temp_dir().join(format!(
-            "aw-sync-missing-open-{}-{}/nope.db",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-missing-open-{}/nope.db",
+            crate::util::unique_test_suffix(),
         ));
         let db = peer_db("dev-missing", "host-missing", missing);
         let mut report = dummy_report();
@@ -1679,12 +1665,8 @@ mod peer_isolation_tests {
     fn mixed_open_keeps_the_readable_peer() {
         use std::os::unix::ffi::OsStringExt;
         let dir = std::env::temp_dir().join(format!(
-            "aw-sync-open-mix-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-open-mix-{}",
+            crate::util::unique_test_suffix(),
         ));
         fs::create_dir_all(&dir).unwrap();
         let good = dir.join("peer.db");
@@ -1719,12 +1701,8 @@ mod peer_isolation_tests {
     fn version_skip_plus_open_failure_counts_only_failures() {
         // Incompatible-version skips must not inflate the all-fail count.
         let dir = std::env::temp_dir().join(format!(
-            "aw-sync-open-vermix-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "aw-sync-open-vermix-{}",
+            crate::util::unique_test_suffix(),
         ));
         fs::create_dir_all(&dir).unwrap();
         let old = dir.join("old.db");

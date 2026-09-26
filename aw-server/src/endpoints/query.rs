@@ -1,5 +1,5 @@
 use rocket::http::Status;
-use rocket::serde::json::{json, Json, Value};
+use rocket::serde::json::Json;
 use rocket::State;
 
 use aw_models::Query;
@@ -46,7 +46,10 @@ mod tests {
 }
 
 #[post("/", data = "<query_req>", format = "application/json")]
-pub fn query(query_req: Json<Query>, state: &State<ServerState>) -> Result<Value, HttpErrorJson> {
+pub fn query(
+    query_req: Json<Query>,
+    state: &State<ServerState>,
+) -> Result<Json<Vec<aw_query::DataType>>, HttpErrorJson> {
     let query_code = query_req.0.query.join("\n");
     let intervals = &query_req.0.timeperiods;
     let mut results = Vec::new();
@@ -61,5 +64,7 @@ pub fn query(query_req: Json<Query>, state: &State<ServerState>) -> Result<Value
         };
         results.push(result);
     }
-    Ok(json!(results))
+    // Serialize the results directly into the response body. Going through
+    // json!() first built a full serde_json::Value copy of every event.
+    Ok(Json(results))
 }

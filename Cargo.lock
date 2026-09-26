@@ -200,6 +200,7 @@ dependencies = [
  "aw-datastore",
  "aw-models",
  "aw-server",
+ "aw-transform",
  "chrono",
  "clap",
  "dirs",

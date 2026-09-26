@@ -137,3 +137,31 @@ fn blocking_client_rejects_non_success_statuses() {
 
     handle.join().expect("join mock server");
 }
+
+#[test]
+fn get_event_maps_404_to_none_and_rejects_other_errors() {
+    let (port, handle) = spawn_mock_server(vec![
+        MockResponse {
+            status_line: "404 Not Found",
+            content_type: "application/json",
+            body: r#"{"message":"missing"}"#,
+        },
+        MockResponse {
+            status_line: "500 Internal Server Error",
+            content_type: "application/json",
+            body: "{}",
+        },
+    ]);
+    let client = AwClient::new("127.0.0.1", port, "aw-client-rust-test").expect("create client");
+
+    let event = block_on(client.get_event("bucket", 1)).expect("404 must not be an error");
+    assert!(event.is_none());
+
+    let err = block_on(client.get_event("bucket", 2)).expect_err("500 response must fail");
+    assert_eq!(
+        err.status(),
+        Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+    );
+
+    handle.join().expect("join mock server");
+}

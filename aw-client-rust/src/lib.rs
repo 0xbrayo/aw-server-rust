@@ -7,7 +7,9 @@ extern crate tokio;
 
 pub mod blocking;
 pub mod classes;
+pub mod config;
 pub mod queries;
+pub mod queue;
 pub mod single_instance;
 
 use std::{collections::HashMap, error::Error};
@@ -17,7 +19,6 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde_json::{json, Map};
 use single_instance::SingleInstance;
 use std::time::Duration;
-use tokio::net::TcpStream;
 
 pub use aw_models::{Bucket, BucketMetadata, Event};
 
@@ -75,8 +76,32 @@ impl AwClient {
         request.send().await?.error_for_status()
     }
 
+    /// Build an API URL from path segments, percent-encoding each one so bucket IDs
+    /// and setting keys containing `/`, `?` or `#` stay a single segment.
+    fn api_url(&self, segments: &[&str]) -> reqwest::Url {
+        let mut url = self.baseurl.clone();
+        // A base URL without path segments (e.g. `data:`) is never http(s), so leave it
+        // as is and let reqwest reject it when the request is sent.
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.pop_if_empty().extend(["api", "0"]).extend(segments);
+        }
+        url
+    }
+
     pub fn new(host: &str, port: u16, name: &str) -> Result<AwClient, Box<dyn Error>> {
         Self::new_with_api_key(host, port, name, None)
+    }
+
+    /// Connect to the server set in `aw-client.toml` (see [`config`]), the file the Python
+    /// client reads. `testing` selects the `[server-testing]` section, whose default port
+    /// is 5666.
+    pub fn from_config(
+        name: &str,
+        testing: bool,
+        api_key: Option<String>,
+    ) -> Result<AwClient, Box<dyn Error>> {
+        let config = config::load_config(testing);
+        Self::new_with_api_key(&config.hostname, config.port, name, api_key)
     }
 
     pub fn new_with_api_key(
@@ -98,6 +123,39 @@ impl AwClient {
             name: name.to_string(),
             hostname,
         })
+    }
+
+    /// Start an offline request queue (see [`queue`]) backed by the default queue file for
+    /// this client name, `testing` selecting a separate file, like `queued=True` in the
+    /// Python client.
+    pub fn request_queue(&self, testing: bool) -> std::io::Result<queue::RequestQueue> {
+        let path = queue::default_queue_path(&self.name, testing).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no data directory for the request queue",
+            )
+        })?;
+        let queue = self.request_queue_at(path)?;
+        if testing {
+            queue.set_commit_interval(queue::DEFAULT_COMMIT_INTERVAL_TESTING);
+        }
+        Ok(queue)
+    }
+
+    /// Like [`request_queue`](Self::request_queue), with an explicit queue file.
+    pub fn request_queue_at(
+        &self,
+        path: std::path::PathBuf,
+    ) -> std::io::Result<queue::RequestQueue> {
+        queue::RequestQueue::start(
+            queue::Transport {
+                client: self.client.clone(),
+                baseurl: self.baseurl.clone(),
+                name: self.name.clone(),
+                hostname: self.hostname.clone(),
+            },
+            path,
+        )
     }
 
     pub async fn get_bucket(&self, bucketname: &str) -> Result<Bucket, reqwest::Error> {
@@ -198,6 +256,23 @@ impl AwClient {
         Self::send_success(self.client.get(url)).await?.json().await
     }
 
+    /// Fetch a single event by id. Returns `Ok(None)` when the server responds 404.
+    pub async fn get_event(
+        &self,
+        bucketname: &str,
+        event_id: i64,
+    ) -> Result<Option<Event>, reqwest::Error> {
+        let url = format!(
+            "{}api/0/buckets/{}/events/{}",
+            self.baseurl, bucketname, event_id
+        );
+        let response = self.client.get(url).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.json().await?))
+    }
+
     pub async fn insert_event(
         &self,
         bucketname: &str,
@@ -274,35 +349,52 @@ impl AwClient {
         Self::send_success(self.client.get(url)).await?.json().await
     }
 
-    /// Wait up to ten seconds for a TCP connection, including DNS and retries.
+    /// Wait up to ten seconds for the server to answer `GET /api/0/info` with its server info.
+    ///
+    /// Refused, dropped or unanswered connections are retried until the deadline. An HTTP
+    /// error status, or a successful response that isn't ActivityWatch server info (another
+    /// program on the port), is returned immediately. `/api/0/info` doesn't require the API
+    /// key, so a wrong key is only reported by the first authenticated request.
     /// Requires a Tokio runtime with networking and time enabled.
     pub async fn wait_for_start(&self) -> Result<(), Box<dyn Error>> {
-        wait_for_server(&self.baseurl, Duration::from_secs(10)).await
+        wait_for_server(
+            &self.client,
+            self.api_url(&["info"]),
+            Duration::from_secs(10),
+        )
+        .await
     }
 }
 
-async fn wait_for_server(url: &reqwest::Url, max_wait: Duration) -> Result<(), Box<dyn Error>> {
-    // URL hosts include brackets around IPv6 literals; DNS lookup takes the bare address.
-    let host = url
-        .host_str()
-        .ok_or("Missing server hostname")?
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let port = url.port_or_known_default().ok_or("Missing server port")?;
+async fn wait_for_server(
+    client: &reqwest::Client,
+    info_url: reqwest::Url,
+    max_wait: Duration,
+) -> Result<(), Box<dyn Error>> {
     let attempts = async {
-        let addresses: Vec<_> = tokio::net::lookup_host((host, port)).await?.collect();
-        if addresses.is_empty() {
-            return Err("Unable to resolve baseurl into socket address".into());
-        }
         let mut retry_delay = Duration::from_millis(100);
         loop {
-            for address in &addresses {
-                if matches!(
-                    tokio::time::timeout(retry_delay, TcpStream::connect(address)).await,
-                    Ok(Ok(_))
-                ) {
-                    return Ok(());
+            // Bound each attempt, so a server that accepts connections but doesn't
+            // answer yet is retried rather than waited on for the client's full timeout.
+            let attempt = client
+                .get(info_url.clone())
+                .timeout(retry_delay.max(Duration::from_millis(500)))
+                .send()
+                .await;
+            match attempt {
+                Ok(response) => {
+                    // A body cut short or stalled past the attempt timeout while the server
+                    // is starting fails `bytes()`; that falls through to a retry.
+                    if let Ok(body) = response.error_for_status()?.bytes().await {
+                        // Decoding checks that it's an ActivityWatch server answering.
+                        serde_json::from_slice::<aw_models::Info>(&body)?;
+                        return Ok(());
+                    }
                 }
+                // Refused, closed before responding (is_request), or unanswered: the server
+                // may still be starting, so retry.
+                Err(err) if err.is_connect() || err.is_request() || err.is_timeout() => {}
+                Err(err) => return Err(err.into()),
             }
             tokio::time::sleep(retry_delay).await;
             retry_delay = (retry_delay * 2).min(Duration::from_secs(1));
@@ -312,7 +404,8 @@ async fn wait_for_server(url: &reqwest::Url, max_wait: Duration) -> Result<(), B
         .await
         .map_err(|_| -> Box<dyn Error> {
             format!(
-                "Local server {host}:{port} not running after {} seconds of retrying",
+                "Server at {} not responding after {} seconds of retrying",
+                info_url.origin().ascii_serialization(),
                 max_wait.as_secs_f64()
             )
             .into()
@@ -323,40 +416,67 @@ async fn wait_for_server(url: &reqwest::Url, max_wait: Duration) -> Result<(), B
 mod tests {
     use super::single_instance_name;
 
-    #[test]
-    fn test_wait_for_start_success() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap();
-        runtime.block_on(async {
+            .unwrap()
+    }
+
+    fn info_url(addr: std::net::SocketAddr) -> reqwest::Url {
+        reqwest::Url::parse(&format!("http://{addr}/api/0/info")).unwrap()
+    }
+
+    const INFO_BODY: &str =
+        r#"{"hostname":"host","version":"v0.0.0","testing":true,"device_id":"device"}"#;
+
+    /// Accept one connection, read the request head, and answer with `status_line` and `body`.
+    async fn answer_once(listener: &tokio::net::TcpListener, status_line: &str, body: &str) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "client closed before sending a request");
+            request.extend_from_slice(&buf[..n]);
+        }
+        assert!(request.starts_with(b"GET /api/0/info "));
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    #[test]
+    fn test_wait_for_start_success() {
+        runtime().block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = reqwest::Url::parse(&format!("http://{}/", listener.local_addr().unwrap()))
-                .unwrap();
-            super::wait_for_server(&url, std::time::Duration::from_secs(1))
-                .await
-                .unwrap();
+            let url = info_url(listener.local_addr().unwrap());
+            let server = async { answer_once(&listener, "200 OK", INFO_BODY).await };
+            let client = reqwest::Client::new();
+            let wait = super::wait_for_server(&client, url, std::time::Duration::from_secs(2));
+            let (_, result) = tokio::join!(server, wait);
+            result.unwrap();
         });
     }
 
     #[test]
     fn test_wait_for_start_retries_without_blocking_executor() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
+        runtime().block_on(async {
             // Reserve a port without listening, then start the server on this same runtime.
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
             socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-            let url =
-                reqwest::Url::parse(&format!("http://{}/", socket.local_addr().unwrap())).unwrap();
+            let url = info_url(socket.local_addr().unwrap());
             let server = tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 let listener = socket.listen(8).unwrap();
-                listener.accept().await.unwrap();
+                answer_once(&listener, "200 OK", INFO_BODY).await;
             });
-            super::wait_for_server(&url, std::time::Duration::from_secs(2))
+            let client = reqwest::Client::new();
+            super::wait_for_server(&client, url, std::time::Duration::from_secs(3))
                 .await
                 .unwrap();
             server.await.unwrap();
@@ -364,20 +484,125 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_for_start_retries_accepted_but_unanswered_connection() {
+        runtime().block_on(async {
+            // A listener that accepts (via the backlog) but never answers, like a server
+            // that has bound its port but isn't serving HTTP yet.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = info_url(listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (_silent, _) = listener.accept().await.unwrap();
+                answer_once(&listener, "200 OK", INFO_BODY).await;
+            });
+            let client = reqwest::Client::new();
+            super::wait_for_server(&client, url, std::time::Duration::from_secs(3))
+                .await
+                .unwrap();
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_wait_for_start_retries_connection_closed_before_response() {
+        runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = info_url(listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                // Read the request, then hang up without answering.
+                let (mut closed, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 1024];
+                let _ = closed.read(&mut buf).await.unwrap();
+                drop(closed);
+                answer_once(&listener, "200 OK", INFO_BODY).await;
+            });
+            let client = reqwest::Client::new();
+            super::wait_for_server(&client, url, std::time::Duration::from_secs(3))
+                .await
+                .unwrap();
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_wait_for_start_retries_truncated_body() {
+        runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = info_url(listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                // Send the headers and half of the body, then hang up.
+                let (mut truncated, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 1024];
+                let _ = truncated.read(&mut buf).await.unwrap();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                    INFO_BODY.len()
+                );
+                truncated.write_all(head.as_bytes()).await.unwrap();
+                truncated
+                    .write_all(&INFO_BODY.as_bytes()[..INFO_BODY.len() / 2])
+                    .await
+                    .unwrap();
+                drop(truncated);
+                answer_once(&listener, "200 OK", INFO_BODY).await;
+            });
+            let client = reqwest::Client::new();
+            super::wait_for_server(&client, url, std::time::Duration::from_secs(3))
+                .await
+                .unwrap();
+            server.await.unwrap();
+        });
+    }
+
+    async fn assert_fails_immediately(status_line: &str, body: &str) -> Box<dyn std::error::Error> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = info_url(listener.local_addr().unwrap());
+        let server = async { answer_once(&listener, status_line, body).await };
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let wait = super::wait_for_server(&client, url, std::time::Duration::from_secs(5));
+        let (_, result) = tokio::join!(server, wait);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        result.unwrap_err()
+    }
+
+    #[test]
+    fn test_wait_for_start_returns_http_errors_immediately() {
+        runtime().block_on(async {
+            let error = assert_fails_immediately("500 Internal Server Error", "{}").await;
+            let error = error.downcast_ref::<reqwest::Error>().unwrap();
+            assert_eq!(
+                error.status(),
+                Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+            );
+        });
+    }
+
+    #[test]
+    fn test_wait_for_start_rejects_other_services() {
+        runtime().block_on(async {
+            let error = assert_fails_immediately("200 OK", r#"{"status":"ok"}"#).await;
+            assert!(
+                error.downcast_ref::<serde_json::Error>().is_some(),
+                "expected a JSON decode error, got {error:?}"
+            );
+        });
+    }
+
+    #[test]
     fn test_wait_for_start_deadline() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
+        runtime().block_on(async {
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
             socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-            let url =
-                reqwest::Url::parse(&format!("http://{}/", socket.local_addr().unwrap())).unwrap();
+            let url = info_url(socket.local_addr().unwrap());
+            let client = reqwest::Client::new();
             let started = std::time::Instant::now();
             let budget = std::time::Duration::from_millis(150);
-            let error = super::wait_for_server(&url, budget).await.unwrap_err();
-            assert!(error.to_string().contains("not running after 0.15 seconds"));
+            let error = super::wait_for_server(&client, url, budget)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("not responding after 0.15 seconds"));
             assert!(started.elapsed() >= budget);
             assert!(started.elapsed() < std::time::Duration::from_secs(2));
         });

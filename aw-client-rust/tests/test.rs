@@ -256,9 +256,13 @@ RETURN = events;",
         let query_result = client.query(&query, vec![timeperiods]).unwrap();
         println!("Query result: {query_result:?}");
 
-        client
-            .delete_event(&bucketname, events[0].id.unwrap())
-            .unwrap();
+        let event_id = events[0].id.unwrap();
+        let fetched = client.get_event(&bucketname, event_id).unwrap().unwrap();
+        assert_eq!(fetched.id, Some(event_id));
+        assert_eq!(fetched.duration, Duration::seconds(1));
+
+        client.delete_event(&bucketname, event_id).unwrap();
+        assert!(client.get_event(&bucketname, event_id).unwrap().is_none());
 
         let count = client.get_event_count(&bucketname).unwrap();
         assert_eq!(count, 0);
@@ -299,5 +303,35 @@ RETURN = events;",
 
             shutdown_handler.notify();
         });
+    }
+
+    // XDG_CONFIG_HOME is only respected by dirs::config_dir() on Linux.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_from_config_reads_aw_client_toml() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_home = std::env::temp_dir().join(format!(
+            "aw-client-rust-client-config-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let config_dir = config_home.join("activitywatch").join("aw-client");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("aw-client.toml"),
+            "[server]\nport = \"5701\"\n[server-testing]\nhostname = \"localhost\"\nport = 5702\n",
+        )
+        .unwrap();
+
+        let (prod, testing) = with_config_home(&config_home, || {
+            let prod = AwClient::from_config("aw-client-rust-config-test", false, None).unwrap();
+            let testing = AwClient::from_config("aw-client-rust-config-test", true, None).unwrap();
+            (prod.baseurl.to_string(), testing.baseurl.to_string())
+        });
+        assert_eq!(prod, "http://127.0.0.1:5701/");
+        assert_eq!(testing, "http://localhost:5702/");
     }
 }

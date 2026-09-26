@@ -96,6 +96,23 @@ mod query_tests {
     }
 
     #[test]
+    fn test_sum_durations_precision() {
+        // Repro from ActivityWatch/aw-server-rust#745: sum_durations came out 1 ms low
+        let ds = setup_datastore_with_bucket();
+        let event: Event = serde_json::from_str(
+            r#"{"timestamp": "2026-01-01T10:00:00Z", "duration": 515.968, "data": {}}"#,
+        )
+        .unwrap();
+        ds.insert_events(BUCKET_ID, &[event]).unwrap();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+        let code = format!(r#"return sum_durations(query_bucket("{BUCKET_ID}"));"#);
+        match aw_query::query(&code, &interval, &ds).unwrap() {
+            DataType::Number(n) => assert_eq!(n, 515.968),
+            ref data => panic!("Wrong datatype, {data:?}"),
+        }
+    }
+
+    #[test]
     fn test_bool() {
         let ds = setup_datastore_empty();
         let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
@@ -339,6 +356,57 @@ mod query_tests {
                 qe => panic!("Expected QueryError::VariableNotDefined, got {qe:?}"),
             },
         }
+    }
+
+    #[test]
+    fn test_flood_pulsetime() {
+        use chrono::{DateTime, Utc};
+        use std::str::FromStr;
+
+        let ds = setup_datastore_with_bucket();
+        let start: DateTime<Utc> = DateTime::from_str("2000-01-01T00:00:00Z").unwrap();
+        let e1 = Event {
+            id: None,
+            timestamp: start,
+            duration: Duration::seconds(10),
+            data: json_map! {"key": json!("a")},
+        };
+        let e2 = Event {
+            id: None,
+            timestamp: start + Duration::seconds(17),
+            duration: Duration::seconds(10),
+            data: json_map! {"key": json!("b")},
+        };
+        ds.insert_events(BUCKET_ID, &[e1, e2]).unwrap();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+
+        let durations = |args: &str| -> Vec<f64> {
+            let code = format!(r#"return flood(query_bucket("{BUCKET_ID}"){args});"#);
+            match aw_query::query(&code, &interval, &ds).unwrap() {
+                aw_query::DataType::List(l) => l
+                    .into_iter()
+                    .map(|e| match e {
+                        aw_query::DataType::Event(e) => {
+                            e.duration.num_milliseconds() as f64 / 1000.0
+                        }
+                        ref data => panic!("Wrong datatype, {data:?}"),
+                    })
+                    .collect(),
+                ref data => panic!("Wrong datatype, {data:?}"),
+            }
+        };
+        // The 7 s gap is left alone with the default pulsetime of 5 s
+        assert_eq!(durations(""), vec![10.0, 10.0]);
+        assert_eq!(durations(", 6.5"), vec![10.0, 10.0]);
+        // and filled in the middle when the gap is at most pulsetime
+        assert_eq!(durations(", 7"), vec![13.5, 13.5]);
+        assert_eq!(durations(", 10.5"), vec![13.5, 13.5]);
+
+        let code = format!(r#"return flood(query_bucket("{BUCKET_ID}"), 0 - 1);"#);
+        assert_err_type!(
+            aw_query::query(&code, &interval, &ds),
+            QueryError::InvalidFunctionParameters(_)
+        );
     }
 
     #[test]
