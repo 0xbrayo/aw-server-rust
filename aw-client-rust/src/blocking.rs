@@ -119,12 +119,26 @@ impl AwClient {
 
 #[test]
 fn test_wait_for_start_blocking_wrapper() {
+    use std::io::{BufRead, BufReader, Write};
+
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let client = AwClient::new(
-        "127.0.0.1",
-        listener.local_addr().unwrap().port(),
-        "test-wait-for-start-blocking",
-    )
-    .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server =
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                line.clear();
+            }
+            stream
+            .write_all(concat!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 74\r\nConnection: close\r\n\r\n",
+                r#"{"hostname":"host","version":"v0.0.0","testing":true,"device_id":"device"}"#
+            ).as_bytes())
+            .unwrap();
+        });
+    let client = AwClient::new("127.0.0.1", port, "test-wait-for-start-blocking").unwrap();
     client.wait_for_start().unwrap();
+    server.join().unwrap();
 }
