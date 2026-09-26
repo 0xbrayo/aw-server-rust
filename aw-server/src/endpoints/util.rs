@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{copy, pipe, Cursor, PipeReader, PipeWriter, Seek, SeekFrom};
 use std::thread;
 
+use chrono::{DateTime, Utc};
 use rocket::http::ContentType;
 use rocket::http::Header;
 use rocket::http::Status;
@@ -45,6 +46,35 @@ pub struct BucketsExportRocket {
     filename: String,
 }
 
+/// Make a client-supplied bucket id safe to interpolate into a response header.
+///
+/// Bucket ids are not restricted at creation, and Rocket percent-decodes path
+/// segments, so an id containing CR/LF would otherwise split the
+/// `Content-Disposition` header (response splitting / header injection).
+fn sanitize_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            c if c.is_control() => '_',
+            '"' | '\\' | ';' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// Build a `Content-Disposition` value for an attachment download.
+///
+/// The filename is quoted: bucket ids may legally contain spaces, and an
+/// unquoted `filename=my bucket.csv` is a malformed parameter that clients may
+/// drop. [`sanitize_header_value`] has already removed the characters that could
+/// break out of the quoted string.
+fn content_disposition(filename: &str) -> String {
+    format!(
+        "attachment; filename=\"{}\"",
+        sanitize_header_value(filename)
+    )
+}
+
 fn export_filename(
     datastore: &aw_datastore::Datastore,
     bucket_id: Option<&str>,
@@ -60,8 +90,8 @@ fn export_filename(
         }
     };
     Ok(match name {
-        Some(id) => format!("attachment; filename=aw-bucket-export_{id}.json"),
-        None => "attachment; filename=aw-buckets-export.json".into(),
+        Some(id) => content_disposition(&format!("aw-bucket-export_{id}.json")),
+        None => content_disposition("aw-buckets-export.json"),
     })
 }
 
@@ -159,6 +189,117 @@ impl<'r> Responder<'r, 'static> for BucketsExportRocket {
     }
 }
 
+// ── CSV streaming export ──────────────────────────────────────────────────────
+
+fn spawn_csv_export_stream(
+    datastore: aw_datastore::Datastore,
+    bucket_id: String,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<u64>,
+    staging: File,
+    writer: PipeWriter,
+) {
+    thread::spawn(move || {
+        // Serialize on the datastore worker, one SQL row at a time, into the
+        // staging file (created during preflight, before the 200 was
+        // committed). The full event set is never materialized in memory, and
+        // a flush failure (e.g. full staging filesystem) surfaces as an error
+        // instead of a silently truncated CSV.
+        let mut staging = match datastore.export_csv_to_file(&bucket_id, start, end, limit, staging)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                error!("CSV export serialization failed: {err:?}");
+                return;
+            }
+        };
+        if let Err(err) = staging.seek(SeekFrom::Start(0)) {
+            error!("CSV staging rewind failed: {err}");
+            return;
+        }
+        let mut writer = pipe_writer_to_file(writer);
+        if let Err(err) = copy(&mut staging, &mut writer) {
+            error!("CSV export copy failed: {err}");
+        }
+    });
+}
+
+pub struct BucketEventsCsvRocket {
+    datastore: aw_datastore::Datastore,
+    bucket_id: String,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<u64>,
+    filename: String,
+    staging: File,
+}
+
+impl BucketEventsCsvRocket {
+    pub fn new(
+        datastore: &aw_datastore::Datastore,
+        bucket_id: &str,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u64>,
+    ) -> Result<Self, HttpErrorJson> {
+        // Resolve 404/500 before headers commit. get_bucket catches a missing
+        // bucket; LIMIT 1 forces the same SQL the full export will run so a
+        // down worker or a prepare/read failure still returns JSON instead of
+        // a 200 with an empty CSV. The staging file is also created here: a
+        // full staging filesystem is still reportable as JSON at this point.
+        // Mid-stream failures after 200 cannot change the status without
+        // delaying headers until serialization finishes — that hung-connection
+        // behavior is what this endpoint exists to avoid (same tradeoff as
+        // JSON export / #721).
+        datastore.get_bucket(bucket_id)?;
+        datastore.get_events(bucket_id, start, end, Some(1))?;
+        let staging = tempfile::tempfile().map_err(|err| {
+            HttpErrorJson::new(
+                Status::InternalServerError,
+                format!("Failed to create CSV staging file: {err}"),
+            )
+        })?;
+        let filename = content_disposition(&format!("aw-events-export-{bucket_id}.csv"));
+        Ok(Self {
+            datastore: datastore.clone(),
+            bucket_id: bucket_id.to_owned(),
+            start,
+            end,
+            limit,
+            filename,
+            staging,
+        })
+    }
+}
+
+impl<'r> Responder<'r, 'static> for BucketEventsCsvRocket {
+    fn respond_to(self, _: &Request) -> response::Result<'static> {
+        let Self {
+            datastore,
+            bucket_id,
+            start,
+            end,
+            limit,
+            filename,
+            staging,
+        } = self;
+        let (reader, writer) = pipe().map_err(|err| {
+            error!("Failed to open CSV export pipe: {err}");
+            Status::InternalServerError
+        })?;
+        spawn_csv_export_stream(datastore, bucket_id, start, end, limit, staging, writer);
+        Response::build()
+            .status(Status::Ok)
+            .header(Header::new("Content-Disposition", filename))
+            .header(ContentType::new("text", "csv"))
+            .streamed_body(rocket::tokio::fs::File::from_std(pipe_reader_to_file(
+                reader,
+            )))
+            .ok()
+    }
+}
+
 use aw_datastore::DatastoreError;
 
 impl From<DatastoreError> for HttpErrorJson {
@@ -176,6 +317,10 @@ impl From<DatastoreError> for HttpErrorJson {
                 Status::NotFound,
                 format!("The requested key(s) '{key}' do not exist"),
             ),
+            DatastoreError::NoSuchEvent(bucket_id, event_id) => HttpErrorJson::new(
+                Status::NotFound,
+                format!("The requested event '{event_id}' does not exist in bucket '{bucket_id}'"),
+            ),
             DatastoreError::MpscError => HttpErrorJson::new(
                 Status::InternalServerError,
                 "Unexpected Mpsc error!".to_string(),
@@ -191,5 +336,39 @@ impl From<DatastoreError> for HttpErrorJson {
                 HttpErrorJson::new(Status::InternalServerError, msg)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{content_disposition, sanitize_header_value};
+
+    #[test]
+    fn content_disposition_quotes_the_filename() {
+        // Spaces are legal in bucket ids; an unquoted filename= parameter with a
+        // space is malformed and clients may drop it.
+        assert_eq!(
+            content_disposition("aw-events-export-my bucket.csv"),
+            "attachment; filename=\"aw-events-export-my bucket.csv\""
+        );
+        assert_eq!(
+            content_disposition("aw-buckets-export.json"),
+            "attachment; filename=\"aw-buckets-export.json\""
+        );
+    }
+
+    #[test]
+    fn sanitize_header_value_strips_header_metacharacters() {
+        assert_eq!(
+            sanitize_header_value("aw-watcher-window_host"),
+            "aw-watcher-window_host"
+        );
+        // CR/LF would split the header; quote/backslash/semicolon would end or
+        // re-parameterize the filename value.
+        assert_eq!(
+            sanitize_header_value("evil\r\nX-Injected: 1"),
+            "evil__X-Injected: 1"
+        );
+        assert_eq!(sanitize_header_value("a\"b\\c;d"), "a_b_c_d");
     }
 }

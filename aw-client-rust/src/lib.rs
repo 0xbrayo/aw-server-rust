@@ -7,7 +7,9 @@ extern crate tokio;
 
 pub mod blocking;
 pub mod classes;
+pub mod config;
 pub mod queries;
+pub mod queue;
 pub mod single_instance;
 
 use std::{collections::HashMap, error::Error};
@@ -90,6 +92,18 @@ impl AwClient {
         Self::new_with_api_key(host, port, name, None)
     }
 
+    /// Connect to the server set in `aw-client.toml` (see [`config`]), the file the Python
+    /// client reads. `testing` selects the `[server-testing]` section, whose default port
+    /// is 5666.
+    pub fn from_config(
+        name: &str,
+        testing: bool,
+        api_key: Option<String>,
+    ) -> Result<AwClient, Box<dyn Error>> {
+        let config = config::load_config(testing);
+        Self::new_with_api_key(&config.hostname, config.port, name, api_key)
+    }
+
     pub fn new_with_api_key(
         host: &str,
         port: u16,
@@ -109,6 +123,39 @@ impl AwClient {
             name: name.to_string(),
             hostname,
         })
+    }
+
+    /// Start an offline request queue (see [`queue`]) backed by the default queue file for
+    /// this client name, `testing` selecting a separate file, like `queued=True` in the
+    /// Python client.
+    pub fn request_queue(&self, testing: bool) -> std::io::Result<queue::RequestQueue> {
+        let path = queue::default_queue_path(&self.name, testing).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no data directory for the request queue",
+            )
+        })?;
+        let queue = self.request_queue_at(path)?;
+        if testing {
+            queue.set_commit_interval(queue::DEFAULT_COMMIT_INTERVAL_TESTING);
+        }
+        Ok(queue)
+    }
+
+    /// Like [`request_queue`](Self::request_queue), with an explicit queue file.
+    pub fn request_queue_at(
+        &self,
+        path: std::path::PathBuf,
+    ) -> std::io::Result<queue::RequestQueue> {
+        queue::RequestQueue::start(
+            queue::Transport {
+                client: self.client.clone(),
+                baseurl: self.baseurl.clone(),
+                name: self.name.clone(),
+                hostname: self.hostname.clone(),
+            },
+            path,
+        )
     }
 
     pub async fn get_bucket(&self, bucketname: &str) -> Result<Bucket, reqwest::Error> {
@@ -207,6 +254,23 @@ impl AwClient {
                 .append_pair("limit", s.to_string().as_str());
         };
         Self::send_success(self.client.get(url)).await?.json().await
+    }
+
+    /// Fetch a single event by id. Returns `Ok(None)` when the server responds 404.
+    pub async fn get_event(
+        &self,
+        bucketname: &str,
+        event_id: i64,
+    ) -> Result<Option<Event>, reqwest::Error> {
+        let url = format!(
+            "{}api/0/buckets/{}/events/{}",
+            self.baseurl, bucketname, event_id
+        );
+        let response = self.client.get(url).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.json().await?))
     }
 
     pub async fn insert_event(

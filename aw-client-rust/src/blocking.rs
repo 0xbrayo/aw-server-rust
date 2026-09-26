@@ -41,6 +41,15 @@ impl AwClient {
         Self::new_with_api_key(host, port, name, None)
     }
 
+    pub fn from_config(
+        name: &str,
+        testing: bool,
+        api_key: Option<String>,
+    ) -> Result<AwClient, Box<dyn Error>> {
+        let config = crate::config::load_config(testing);
+        Self::new_with_api_key(&config.hostname, config.port, name, api_key)
+    }
+
     pub fn new_with_api_key(
         host: &str,
         port: u16,
@@ -76,6 +85,7 @@ impl AwClient {
         query: &str,
         timeperiods: Vec<(DateTime<Utc>, DateTime<Utc>)>
     );
+    proxy_method!(get_event, Option<Event>, bucketname: &str, event_id: i64);
     proxy_method!(insert_event, (), bucketname: &str, event: &Event);
     proxy_method!(insert_events, (), bucketname: &str, events: Vec<Event>);
     proxy_method!(
@@ -90,6 +100,17 @@ impl AwClient {
     proxy_method!(get_info, aw_models::Info,);
     proxy_method!(get_setting, serde_json::Value, setting: &str);
     proxy_method!(get_settings, aw_models::Settings,);
+
+    pub fn request_queue(&self, testing: bool) -> std::io::Result<crate::queue::RequestQueue> {
+        self.client.request_queue(testing)
+    }
+
+    pub fn request_queue_at(
+        &self,
+        path: std::path::PathBuf,
+    ) -> std::io::Result<crate::queue::RequestQueue> {
+        self.client.request_queue_at(path)
+    }
 
     pub fn wait_for_start(&self) -> Result<(), Box<dyn Error>> {
         block_on(self.client.wait_for_start())

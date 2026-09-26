@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use super::functions;
@@ -22,11 +22,26 @@ pub enum DataType {
     String(String),
     Event(Event),
     List(Vec<DataType>),
+    #[serde(serialize_with = "serialize_dict_sorted")]
     Dict(HashMap<String, DataType>),
     #[serde(serialize_with = "serialize_function")]
     Function(String, functions::QueryFn),
     #[serde(serialize_with = "serialize_function")]
     ReadOnlyFunction(String, functions::ReadOnlyQueryFn),
+}
+
+// Query results are serialized straight to the response body, so HashMap
+// iteration order would leak into the output. Sort keys to keep responses
+// deterministic (and identical to the previous serde_json::Value round-trip).
+fn serialize_dict_sorted<S>(
+    dict: &HashMap<String, DataType>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let sorted: BTreeMap<&String, &DataType> = dict.iter().collect();
+    sorted.serialize(serializer)
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
